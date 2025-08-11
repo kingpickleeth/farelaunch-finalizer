@@ -115,41 +115,53 @@ async function checkFinalizeEligibility(pool: `0x${string}`) {
     endAt: endAt.toString(),
   };
 }
-
 async function callFinalize(pool: `0x${string}`): Promise<`0x${string}`> {
-  // preflight; skip tx if not eligible
-  const st = await checkFinalizeEligibility(pool);
-  if (!st.canFinalize) {
-    log.info({ pool, reason: 'not_eligible', ...st }, 'preflight: skip finalize');
-    throw new Error('Finalize not eligible yet (Window)');
-  }
-
-  try {
-    const hash = await walletClient.writeContract({
-      address: pool,
-      abi: presalePoolAbi,
-      functionName: 'finalize',
-      chain,
-      account,
-    });
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
-    if (receipt.status !== 'success') throw new Error(`Finalize tx failed: ${hash}`);
-    return hash;
-  } catch (e: any) {
-    // Try to surface custom error selector for clarity
-    const data = e?.data || e?.cause?.data;
-    const sel = typeof data === 'string' ? data.slice(0, 10) : undefined;
-    if (sel === '0x86997fcd') {
-      log.warn({ pool, selector: sel, msg: e?.shortMessage || e?.message }, 'reverted: Window()');
-    } else if (sel) {
-      log.warn({ pool, selector: sel, msg: e?.shortMessage || e?.message }, 'reverted: custom error');
-    } else {
-      log.warn({ pool, msg: e?.shortMessage || e?.message }, 'reverted');
+    // preflight; skip or mark failed based on on-chain state
+    const st = await checkFinalizeEligibility(pool);
+  
+    // If we are after endAt and below soft cap, this sale failed.
+    const afterEnd = st.now >= Number(st.endAt);
+    const belowSoft = BigInt(st.totalRaised) < BigInt(st.softCap);
+  
+    if (!st.canFinalize && afterEnd && belowSoft && !st.finalized && !st.failed) {
+      log.info({ pool, ...st }, 'preflight: mark failed (below soft cap after end)');
+      // NOTE: we don't know launch id here, so processOne updates the row.
+      // Return a sentinel by throwing; processOne will catch and set failed.
+      const err = new Error('SALE_FAILED_BELOW_SOFTCAP');
+      (err as any).__saleFailed = true;
+      throw err;
     }
-    throw e;
-  }
-}
-
+  
+    if (!st.canFinalize) {
+      log.info({ pool, reason: 'not_eligible', ...st }, 'preflight: skip finalize');
+      // Throw a normal error so processOne records attempt & moves on (will retry later)
+      throw new Error('Finalize not eligible yet (Window)');
+    }
+  
+    try {
+      const hash = await walletClient.writeContract({
+        address: pool,
+        abi: presalePoolAbi,
+        functionName: 'finalize',
+        chain,
+        account,
+      });
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      if (receipt.status !== 'success') throw new Error(`Finalize tx failed: ${hash}`);
+      return hash;
+    } catch (e: any) {
+      const data = e?.data || e?.cause?.data;
+      const sel = typeof data === 'string' ? data.slice(0, 10) : undefined;
+      if (sel === '0x86997fcd') {
+        log.warn({ pool, selector: sel, msg: e?.shortMessage || e?.message }, 'reverted: Window()');
+      } else if (sel) {
+        log.warn({ pool, selector: sel, msg: e?.shortMessage || e?.message }, 'reverted: custom error');
+      } else {
+        log.warn({ pool, msg: e?.shortMessage || e?.message }, 'reverted');
+      }
+      throw e;
+    }
+  }  
 // --- in-memory processing lock to suppress duplicate concurrent runs ---
 const processing = new Set<string>();
 function markStart(id: string): boolean {
@@ -229,18 +241,29 @@ async function processOne(row: Launch) {
     if (error) throw error;
 
     log.info({ id, pool, tx: hash, attempts, already }, 'finalized');
-  } catch (e: any) {
+} catch (e: any) {
+    const saleFailed = e && e.__saleFailed === true;
+  
     log.error({ id, pool, err: e?.message || String(e) }, 'finalize failed');
+  
+    const update: any = {
+      finalizing: false,
+      finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+      finalize_error: e?.message || String(e),
+      updated_at: new Date().toISOString(),
+    };
+  
+    if (saleFailed) {
+      update.status = 'failed';     // <-- mark failed in DB
+      update.finalized = false;
+    }
+  
     await supabase
       .from('launches')
-      .update({
-        finalizing: false, // release lock to allow retries
-        finalize_attempts: (row.finalize_attempts ?? 0) + 1,
-        finalize_error: e?.message || String(e),
-        updated_at: new Date().toISOString(),
-      })
+      .update(update)
       .eq('id', id);
-  } finally {
+  }
+   finally {
     markDone(id);
   }
 }
