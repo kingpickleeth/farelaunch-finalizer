@@ -1,46 +1,56 @@
 import 'dotenv/config';
-import express from 'express';
+import express, { type Request, type Response } from 'express';
 import pino from 'pino';
 import { createClient as createSb } from '@supabase/supabase-js';
-import { createPublicClient, createWalletClient, http, parseAbi, getAddress } from 'viem';
+import {
+  createPublicClient,
+  createWalletClient,
+  http,
+  parseAbi,
+  getAddress,
+  defineChain,
+  type Chain,
+} from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { defineChain, type Chain } from 'viem';
 
 const log = pino({
   level: process.env.LOG_LEVEL || 'info',
-  transport: process.env.NODE_ENV === 'production' ? undefined : { target: 'pino-pretty' }
+  transport: process.env.NODE_ENV === 'production' ? undefined : { target: 'pino-pretty' },
 });
 
-const {
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY,
-  RPC_URL,
-  CHAIN_ID = '1',
-  PRIVATE_KEY
-} = process.env;
+const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RPC_URL, CHAIN_ID = '1', PRIVATE_KEY } =
+  process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !RPC_URL || !PRIVATE_KEY) {
-  log.fatal({ SUPABASE_URL: !!SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY: !!SUPABASE_SERVICE_ROLE_KEY, RPC_URL: !!RPC_URL, PRIVATE_KEY: !!PRIVATE_KEY }, 'Missing required env vars');
+  log.fatal(
+    {
+      SUPABASE_URL: !!SUPABASE_URL,
+      SUPABASE_SERVICE_ROLE_KEY: !!SUPABASE_SERVICE_ROLE_KEY,
+      RPC_URL: !!RPC_URL,
+      PRIVATE_KEY: !!PRIVATE_KEY,
+    },
+    'Missing required env vars',
+  );
   process.exit(1);
 }
 
 const supabase = createSb(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
 const chain: Chain = defineChain({
-  id: Number(process.env.CHAIN_ID || 1),
+  id: Number(CHAIN_ID || 1),
   name: 'ApeChain',
   nativeCurrency: { name: 'APE', symbol: 'APE', decimals: 18 },
-  rpcUrls: { default: { http: [process.env.RPC_URL!] } }
+  rpcUrls: { default: { http: [RPC_URL!] } },
 });
-const publicClient = createPublicClient({ transport: http(process.env.RPC_URL!), chain });
+const publicClient = createPublicClient({ transport: http(RPC_URL!), chain });
 const account = privateKeyToAccount(
-  process.env.PRIVATE_KEY!.startsWith('0x') ? (process.env.PRIVATE_KEY! as `0x${string}`) : (`0x${process.env.PRIVATE_KEY}` as `0x${string}`)
+  PRIVATE_KEY!.startsWith('0x') ? (PRIVATE_KEY! as `0x${string}`) : (`0x${PRIVATE_KEY}` as `0x${string}`),
 );
-const walletClient = createWalletClient({ account, chain, transport: http(process.env.RPC_URL!) });
+const walletClient = createWalletClient({ account, chain, transport: http(RPC_URL!) });
 
 const presalePoolAbi = parseAbi([
   'function finalize() external',
-  'function finalized() view returns (bool)'
+  'function finalized() view returns (bool)',
 ]);
 
 type Launch = {
@@ -49,11 +59,16 @@ type Launch = {
   status: string;
   finalized: boolean;
   finalize_attempts: number | null;
+  finalizing?: boolean | null;
 };
 
 async function readFinalized(pool: `0x${string}`): Promise<boolean> {
   try {
-    return await publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'finalized' }) as boolean;
+    return (await publicClient.readContract({
+      address: pool,
+      abi: presalePoolAbi,
+      functionName: 'finalized',
+    })) as boolean;
   } catch {
     // if view not available, assume not finalized
     return false;
@@ -61,26 +76,41 @@ async function readFinalized(pool: `0x${string}`): Promise<boolean> {
 }
 
 async function callFinalize(pool: `0x${string}`): Promise<`0x${string}`> {
-    const hash = await walletClient.writeContract({
-        address: pool,
-        abi: presalePoolAbi,
-        functionName: 'finalize',
-        chain,     // <-- fixes the TS error
-        account    // <-- explicit is safest with viem v2 types
-      });      
+  const hash = await walletClient.writeContract({
+    address: pool,
+    abi: presalePoolAbi,
+    functionName: 'finalize',
+    chain,
+    account,
+  });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== 'success') throw new Error(`Finalize tx failed: ${hash}`);
   return hash;
 }
 
-// Simple "claim" using a compare-and-set on (status, finalized)
+// --- in-memory processing lock to suppress duplicate concurrent runs (3A) ---
+const processing = new Set<string>();
+function markStart(id: string): boolean {
+  if (processing.has(id)) return false;
+  processing.add(id);
+  return true;
+}
+function markDone(id: string) {
+  processing.delete(id);
+}
+
+// Compare-and-set DB lock: flip finalizing=false -> true so only one worker proceeds
 async function tryClaim(id: string): Promise<boolean> {
   const { data, error } = await supabase
     .from('launches')
-    .update({ /* no status change to avoid enum issues */ updated_at: new Date().toISOString() })
+    .update({
+      finalizing: true,
+      updated_at: new Date().toISOString(),
+    })
     .eq('id', id)
     .eq('status', 'ended')
     .eq('finalized', false)
+    .eq('finalizing', false) // lock guard
     .select('id')
     .maybeSingle();
 
@@ -97,19 +127,24 @@ async function processOne(row: Launch) {
     return;
   }
 
-  const id = row.id;
-  const pool = getAddress(row.pool_address) as `0x${string}`;
-
-  // attempt to claim
-  const claimed = await tryClaim(id);
-  if (!claimed) {
-    log.debug({ id }, 'could not claim row (maybe another worker is processing or not ended)');
+  if (!markStart(row.id)) {
+    log.debug({ id: row.id }, 'already processing; skip');
     return;
   }
 
-  const attempts = (row.finalize_attempts ?? 0) + 1;
+  const id = row.id;
+  const pool = getAddress(row.pool_address) as `0x${string}`;
 
   try {
+    // attempt to claim DB lock
+    const claimed = await tryClaim(id);
+    if (!claimed) {
+      log.debug({ id }, 'could not claim row (another worker/instance or not eligible)');
+      return;
+    }
+
+    const attempts = (row.finalize_attempts ?? 0) + 1;
+
     const already = await readFinalized(pool);
     let hash: `0x${string}` | null = null;
 
@@ -121,10 +156,11 @@ async function processOne(row: Launch) {
       .from('launches')
       .update({
         finalized: true,
+        finalizing: false,
         finalize_tx_hash: hash,
         finalize_attempts: attempts,
         finalize_error: null,
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
       })
       .eq('id', id);
 
@@ -136,16 +172,18 @@ async function processOne(row: Launch) {
     await supabase
       .from('launches')
       .update({
-        finalize_attempts: attempts,
+        finalizing: false, // release lock to allow retries
+        finalize_attempts: (row.finalize_attempts ?? 0) + 1,
         finalize_error: e?.message || String(e),
-        updated_at: new Date().toISOString()
+        updated_at: new Date().toISOString(),
       })
       .eq('id', id);
-    // let poller/RT retry on next cycle
+  } finally {
+    markDone(id);
   }
 }
 
-// Realtime subscription: react when a row becomes ended & not finalized
+// Realtime subscription with stricter filter (3B/4)
 function startRealtime() {
   const ch = supabase
     .channel('launches-ended')
@@ -153,19 +191,36 @@ function startRealtime() {
       'postgres_changes',
       { event: 'UPDATE', schema: 'public', table: 'launches' },
       (payload) => {
-        const next = payload.new as any;
-        if (next?.status === 'ended' && next?.finalized === false) {
-          const row = {
+        // If you ran: ALTER TABLE public.launches REPLICA IDENTITY FULL;
+        // then payload.old will be populated and we can check a true transition.
+        const prev = (payload as any).old as Partial<Launch> | undefined;
+        const next = (payload as any).new as Launch;
+
+        // Only react if it still needs work:
+        const needsWork =
+          next?.status === 'ended' && next?.finalized === false && (next as any)?.finalizing === false;
+
+        // If we have previous row, ensure this was a transition INTO 'ended'.
+        const transitionedIntoEnded = prev ? prev.status !== 'ended' && next.status === 'ended' : true;
+
+        if (needsWork && transitionedIntoEnded) {
+          log.info({ id: next.id }, 'RT: ended → claim');
+          processOne({
             id: next.id,
-            pool_address: next.pool_address,
+            pool_address: next.pool_address as any,
             status: next.status,
             finalized: next.finalized,
-            finalize_attempts: next.finalize_attempts
-          } as Launch;
-          log.info({ id: row.id }, 'RT: ended detected → process');
-          processOne(row).catch(() => {});
+            finalize_attempts: (next as any).finalize_attempts ?? 0,
+            finalizing: (next as any).finalizing ?? false,
+          }).catch(() => {});
+        } else {
+          // Quiet debug for noisy updates
+          log.debug(
+            { id: next?.id, needsWork, transitionedIntoEnded, status: next?.status, finalized: next?.finalized, finalizing: (next as any)?.finalizing },
+            'RT: ignore',
+          );
         }
-      }
+      },
     )
     .subscribe((status, err) => {
       log.info({ status, err }, 'realtime subscription status');
@@ -174,13 +229,14 @@ function startRealtime() {
   return ch;
 }
 
-// Periodic poll as a safety net
+// Safety-net poller (kept minimal logs)
 async function pollOnce() {
   const { data, error } = await supabase
     .from('launches')
-    .select('id, pool_address, status, finalized, finalize_attempts')
+    .select('id, pool_address, status, finalized, finalize_attempts, finalizing')
     .eq('status', 'ended')
     .eq('finalized', false)
+    .eq('finalizing', false)
     .limit(50);
 
   if (error) {
@@ -197,16 +253,15 @@ function startPoller() {
   const ms = Number(process.env.POLL_INTERVAL_MS || 15000);
   log.info({ ms }, 'starting poller');
   setInterval(() => {
-    pollOnce().catch(err => log.error({ err }, 'pollOnce failed'));
+    pollOnce().catch((err) => log.error({ err }, 'pollOnce failed'));
   }, ms);
 }
 
 // Health endpoint for Railway
 function startHttp() {
   const app = express();
-  app.get('/health', async (_req, res) => {
+  app.get('/health', async (_req: Request, res: Response) => {
     try {
-      // quick smoke test to DB
       const { error } = await supabase.from('launches').select('id').limit(1);
       if (error) throw error;
       res.json({ ok: true, time: new Date().toISOString(), address: account.address });
@@ -225,7 +280,7 @@ async function main() {
   log.info('worker started');
 }
 
-main().catch(err => {
+main().catch((err) => {
   log.fatal({ err }, 'fatal');
   process.exit(1);
 });
