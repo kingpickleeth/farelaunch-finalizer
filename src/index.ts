@@ -48,9 +48,18 @@ const account = privateKeyToAccount(
 );
 const walletClient = createWalletClient({ account, chain, transport: http(RPC_URL!) });
 
+// ABI with preflight views + custom error
 const presalePoolAbi = parseAbi([
+  // tx + views
   'function finalize() external',
   'function finalized() view returns (bool)',
+  'function softCap() view returns (uint256)',
+  'function hardCap() view returns (uint256)',
+  'function totalRaised() view returns (uint256)',
+  'function endAt() view returns (uint256)',
+  'function failed() view returns (bool)',
+  // custom error from your contract
+  'error Window()',
 ]);
 
 type Launch = {
@@ -70,25 +79,78 @@ async function readFinalized(pool: `0x${string}`): Promise<boolean> {
       functionName: 'finalized',
     })) as boolean;
   } catch {
-    // if view not available, assume not finalized
     return false;
   }
 }
 
-async function callFinalize(pool: `0x${string}`): Promise<`0x${string}`> {
-  const hash = await walletClient.writeContract({
-    address: pool,
-    abi: presalePoolAbi,
-    functionName: 'finalize',
-    chain,
-    account,
-  });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
-  if (receipt.status !== 'success') throw new Error(`Finalize tx failed: ${hash}`);
-  return hash;
+// --- NEW: on-chain preflight that mirrors your finalize() guards ---
+async function checkFinalizeEligibility(pool: `0x${string}`) {
+  const [softCap, hardCap, totalRaised, endAt, finalized, failed] = await Promise.all([
+    publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'softCap' }) as Promise<bigint>,
+    publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'hardCap' }) as Promise<bigint>,
+    publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'totalRaised' }) as Promise<bigint>,
+    publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'endAt' }) as Promise<bigint>,
+    publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'finalized' }) as Promise<boolean>,
+    publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'failed' }) as Promise<boolean>,
+  ]);
+
+  const block = await publicClient.getBlock();
+  const now = Number(block.timestamp); // seconds
+
+  const canFinalize =
+    (!finalized && !failed) &&
+    (
+      (totalRaised >= softCap && now >= Number(endAt)) ||
+      (totalRaised >= hardCap)
+    );
+
+  return {
+    canFinalize,
+    finalized,
+    failed,
+    now,
+    softCap: softCap.toString(),
+    hardCap: hardCap.toString(),
+    totalRaised: totalRaised.toString(),
+    endAt: endAt.toString(),
+  };
 }
 
-// --- in-memory processing lock to suppress duplicate concurrent runs (3A) ---
+async function callFinalize(pool: `0x${string}`): Promise<`0x${string}`> {
+  // preflight; skip tx if not eligible
+  const st = await checkFinalizeEligibility(pool);
+  if (!st.canFinalize) {
+    log.info({ pool, reason: 'not_eligible', ...st }, 'preflight: skip finalize');
+    throw new Error('Finalize not eligible yet (Window)');
+  }
+
+  try {
+    const hash = await walletClient.writeContract({
+      address: pool,
+      abi: presalePoolAbi,
+      functionName: 'finalize',
+      chain,
+      account,
+    });
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (receipt.status !== 'success') throw new Error(`Finalize tx failed: ${hash}`);
+    return hash;
+  } catch (e: any) {
+    // Try to surface custom error selector for clarity
+    const data = e?.data || e?.cause?.data;
+    const sel = typeof data === 'string' ? data.slice(0, 10) : undefined;
+    if (sel === '0x86997fcd') {
+      log.warn({ pool, selector: sel, msg: e?.shortMessage || e?.message }, 'reverted: Window()');
+    } else if (sel) {
+      log.warn({ pool, selector: sel, msg: e?.shortMessage || e?.message }, 'reverted: custom error');
+    } else {
+      log.warn({ pool, msg: e?.shortMessage || e?.message }, 'reverted');
+    }
+    throw e;
+  }
+}
+
+// --- in-memory processing lock to suppress duplicate concurrent runs ---
 const processing = new Set<string>();
 function markStart(id: string): boolean {
   if (processing.has(id)) return false;
@@ -183,7 +245,7 @@ async function processOne(row: Launch) {
   }
 }
 
-// Realtime subscription with stricter filter (3B/4)
+// Realtime subscription with stricter filter
 function startRealtime() {
   const ch = supabase
     .channel('launches-ended')
@@ -198,7 +260,9 @@ function startRealtime() {
 
         // Only react if it still needs work:
         const needsWork =
-          next?.status === 'ended' && next?.finalized === false && (next as any)?.finalizing === false;
+          next?.status === 'ended' &&
+          next?.finalized === false &&
+          (next as any)?.finalizing === false;
 
         // If we have previous row, ensure this was a transition INTO 'ended'.
         const transitionedIntoEnded = prev ? prev.status !== 'ended' && next.status === 'ended' : true;
@@ -214,9 +278,15 @@ function startRealtime() {
             finalizing: (next as any).finalizing ?? false,
           }).catch(() => {});
         } else {
-          // Quiet debug for noisy updates
           log.debug(
-            { id: next?.id, needsWork, transitionedIntoEnded, status: next?.status, finalized: next?.finalized, finalizing: (next as any)?.finalizing },
+            {
+              id: next?.id,
+              needsWork,
+              transitionedIntoEnded,
+              status: next?.status,
+              finalized: next?.finalized,
+              finalizing: (next as any)?.finalizing,
+            },
             'RT: ignore',
           );
         }
@@ -229,7 +299,7 @@ function startRealtime() {
   return ch;
 }
 
-// Safety-net poller (kept minimal logs)
+// Safety-net poller
 async function pollOnce() {
   const { data, error } = await supabase
     .from('launches')
