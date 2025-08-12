@@ -607,6 +607,7 @@ function startHttp() {
       res.status(500).json({ ok: false, error: e?.message || String(e) });
     }
   });
+  app.get('/', (_req, res) => res.status(200).send('ok'));
 
   const port = Number(process.env.PORT || 8080);
   app.listen(port, () => log.info({ port, addr: account.address }, 'health server up'));
