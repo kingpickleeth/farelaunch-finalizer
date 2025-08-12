@@ -476,6 +476,8 @@ async function processOne(row: Launch) {
 }
 
 // ---------- Realtime & Poller ----------
+
+// (optional) auto re-subscribe if realtime drops
 function startRealtime() {
   const ch = supabase
     .channel('launches-status')
@@ -483,22 +485,26 @@ function startRealtime() {
       'postgres_changes',
       { event: '*', schema: 'public', table: 'launches' },
       async (payload) => {
-        const next = (payload as any).new as Launch | undefined;
+        const next = payload.new as Launch | undefined;
         if (!next) return;
 
         try {
           const reconciled = await reconcileStatus({
             id: next.id,
             status: next.status as Status,
-            start_at: (next as any).start_at,
-            end_at: (next as any).end_at,
+            start_at: next.start_at,
+            end_at: next.end_at,
             pool_address: next.pool_address as any,
             finalized: next.finalized,
             finalizing: (next as any).finalizing ?? false,
             finalize_attempts: (next as any).finalize_attempts ?? 0,
           });
 
-          if (reconciled === 'ended' && next.finalized === false && (next as any).finalizing === false) {
+          if (
+            reconciled === 'ended' &&
+            next.finalized === false &&
+            (next as any).finalizing === false
+          ) {
             log.info({ id: next.id }, 'RT: ended → process');
             processOne({
               id: next.id,
@@ -506,22 +512,31 @@ function startRealtime() {
               pool_address: next.pool_address as any,
               finalized: next.finalized,
               finalizing: (next as any).finalizing ?? false,
-              start_at: (next as any).start_at,
-              end_at: (next as any).end_at,
+              start_at: next.start_at,
+              end_at: next.end_at,
               finalize_attempts: (next as any).finalize_attempts ?? 0,
             }).catch(() => {});
           }
         } catch (err) {
-          log.error({ err, id: next.id }, 'realtime reconcile failed');
+          log.error({ err, id: next?.id }, 'realtime reconcile failed');
         }
       },
     )
-    .subscribe((status, err) => {
-      log.info({ status, err }, 'realtime subscription status');
+    // NOTE: subscribe takes a single status callback in v2.x
+    .subscribe((status) => {
+      log.info({ status }, 'realtime subscription status');
+      if (status === 'CLOSED' || status === 'TIMED_OUT') {
+        log.warn({ status }, 'realtime closed, retrying in 2s');
+        setTimeout(() => {
+          // keep a strong ref if you store it globally
+          _realtime = startRealtime();
+        }, 2000);
+      }
     });
 
   return ch;
 }
+
 async function pollOnce() {
   const { data } = await supabase
     .from('launches')
@@ -549,16 +564,15 @@ async function pollOnce() {
 
 // top-level
 let _pollTimer: NodeJS.Timer | null = null;
-let _lastTick = Date.now();
+let _realtime: ReturnType<typeof startRealtime> | null = null;
 
+// clamp + log poll interval
 function getPollMs() {
   const raw = process.env.POLL_INTERVAL_MS ?? '3000';
   const n = Number.parseInt(raw, 10);
   const ms = Number.isFinite(n) ? n : 3000;
-  const clamped = Math.min(Math.max(ms, 500), 60_000);
-  if (clamped !== n) {
-    log.warn({ raw, parsed: n, using: clamped }, 'POLL_INTERVAL_MS invalid or out of range; clamped');
-  }
+  const clamped = Math.min(Math.max(ms, 1000), 60000);
+  if (clamped !== n) log.warn({ raw, parsed: n, using: clamped }, 'POLL_INTERVAL_MS adjusted');
   return clamped;
 }
 
@@ -566,14 +580,11 @@ function startPoller() {
   const ms = getPollMs();
   log.info({ ms }, 'starting poller');
   const t = setInterval(() => {
-    const now = Date.now();
-    const drift = now - _lastTick - ms;
-    _lastTick = now;
-    if (Math.abs(drift) > 1000) log.warn({ drift }, 'poll drift');
     pollOnce().catch((err) => log.error({ err }, 'pollOnce failed'));
   }, ms);
   return t;
 }
+
 // ---------- Health server ----------
 function startHttp() {
   const app = express();
@@ -648,18 +659,21 @@ app.get('*', (_req, res) => res.status(200).send('ok'));
     log.info({ port, addr: account.address }, 'health server up');
   });
 }
+process.on('unhandledRejection', (reason) => log.fatal({ reason }, 'unhandledRejection'));
+process.on('uncaughtException', (err) => log.fatal({ err }, 'uncaughtException'));
+process.on('exit', (code) => log.warn({ code }, 'process exit'));
 
-// (optional) log if the platform sends a stop
+// IMPORTANT: don't exit on SIGTERM
 process.on('SIGTERM', () => {
-  log.warn('received SIGTERM (platform stop), shutting down gracefully');
-  process.exit(0);
+  log.warn('received SIGTERM (platform stop) — not calling process.exit');
 });
 
 // ---------- Main ----------
 async function main() {
   startHttp();
-  startRealtime();
-  startPoller();
+  _realtime = startRealtime();
+  await pollOnce().catch((e) => log.error({ e }, 'initial poll failed'));
+  _pollTimer = startPoller();
   log.info({ chainId: chain.id, factory: FACTORY_ADDRESS }, 'worker started');
 }
 
