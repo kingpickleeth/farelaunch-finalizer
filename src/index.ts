@@ -553,6 +553,8 @@ function startHttp() {
   app.use(express.json());
 
   // Health
+  // inside startHttp(), before app.listen(...)
+  app.get('/', (_req, res) => res.status(200).send('ok'));
   app.get('/health', async (_req: Request, res: Response) => {
     try {
       const { error } = await supabase.from('launches').select('id').limit(1);
@@ -608,10 +610,21 @@ function startHttp() {
     }
   });
 
-  const port = Number(process.env.PORT || 8080);
-  app.listen(port, () => log.info({ port, addr: account.address }, 'health server up'));
+  const raw = process.env.PORT ?? '';
+  const parsed = parseInt(raw, 10);
+  const port = Number.isFinite(parsed) && parsed > 0 ? parsed : 8080; // 8080 for local only
+  log.info({ rawEnvPort: process.env.PORT }, 'startup: PORT from env');
+
+  app.listen(port, '0.0.0.0', () => {
+    log.info({ port, addr: account.address }, 'health server up');
+  });
 }
 
+// (optional) log if the platform sends a stop
+process.on('SIGTERM', () => {
+  log.warn('received SIGTERM (platform stop), shutting down gracefully');
+  process.exit(0);
+});
 
 // ---------- Main ----------
 async function main() {
