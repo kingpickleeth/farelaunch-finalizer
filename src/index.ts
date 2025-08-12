@@ -537,15 +537,33 @@ async function pollOnce() {
     }
   }
 }
+// top-level
+let _pollTimer: NodeJS.Timer | null = null;
+let _lastTick = Date.now();
 
-function startPoller() {
-  const ms = Number(POLL_INTERVAL_MS || 3000);
-  log.info({ ms }, 'starting poller');
-  setInterval(() => {
-    pollOnce().catch((err) => log.error({ err }, 'pollOnce failed'));
-  }, ms);
+function getPollMs() {
+  const raw = process.env.POLL_INTERVAL_MS ?? '3000';
+  const n = Number.parseInt(raw, 10);
+  const ms = Number.isFinite(n) ? n : 3000;
+  const clamped = Math.min(Math.max(ms, 500), 60_000);
+  if (clamped !== n) {
+    log.warn({ raw, parsed: n, using: clamped }, 'POLL_INTERVAL_MS invalid or out of range; clamped');
+  }
+  return clamped;
 }
 
+function startPoller() {
+  const ms = getPollMs();
+  log.info({ ms }, 'starting poller');
+  const t = setInterval(() => {
+    const now = Date.now();
+    const drift = now - _lastTick - ms;
+    _lastTick = now;
+    if (Math.abs(drift) > 1000) log.warn({ drift }, 'poll drift');
+    pollOnce().catch((err) => log.error({ err }, 'pollOnce failed'));
+  }, ms);
+  return t;
+}
 // ---------- Health server ----------
 function startHttp() {
   const app = express();
