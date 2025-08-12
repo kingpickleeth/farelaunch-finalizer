@@ -554,7 +554,6 @@ function startHttp() {
 
   // Health
   // inside startHttp(), before app.listen(...)
-  app.get('/', (_req, res) => res.status(200).send('ok'));
   app.get('/health', async (_req: Request, res: Response) => {
     try {
       const { error } = await supabase.from('launches').select('id').limit(1);
@@ -564,7 +563,10 @@ function startHttp() {
       res.status(500).json({ ok: false, error: e?.message || String(e) });
     }
   });
-
+  app.get('/', (_req, res) => res.status(200).send('ok'));
+  // catch-all 200 for GET to satisfy any default probe hitting '/' or another path
+  app.get('*', (_req, res) => res.status(200).send('ok'));
+  
   // Manually trigger a sync() on a given pair (no swap)
   app.post('/sync-now', async (req: Request, res: Response) => {
     try {
