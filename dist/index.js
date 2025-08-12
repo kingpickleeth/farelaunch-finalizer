@@ -12,7 +12,7 @@ const log = pino({
 });
 // ---------- Env ----------
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, RPC_URL, CHAIN_ID = '1', PRIVATE_KEY, FACTORY_ADDRESS = '0x7d8c6B58BA2d40FC6E34C25f9A488067Fe0D2dB4', // Camelot AMM v2 (ApeChain)
-PORT = '8080', POLL_INTERVAL_MS = '3000', } = process.env;
+ POLL_INTERVAL_MS = '3000', } = process.env;
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !RPC_URL || !PRIVATE_KEY) {
     log.fatal({
         SUPABASE_URL: !!SUPABASE_URL,
