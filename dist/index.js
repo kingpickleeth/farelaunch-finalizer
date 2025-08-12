@@ -452,7 +452,7 @@ async function pollOnce() {
     }
 }
 function startPoller() {
-    const ms = Number(POLL_INTERVAL_MS || 15000);
+    const ms = Number(POLL_INTERVAL_MS || 10001);
     log.info({ ms }, 'starting poller');
     setInterval(() => {
         pollOnce().catch((err) => log.error({ err }, 'pollOnce failed'));
