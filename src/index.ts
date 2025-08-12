@@ -165,20 +165,30 @@ function computeNextStatus(row: Launch, chain: ChainSnapshot | null, nowMs: numb
   if (!afterEnd) return 'active';
   return 'ended';
 }
-
 async function reconcileStatus(row: Launch): Promise<Status> {
   const nowMs = Date.now();
-  const readChain =
-    !!row.pool_address && (row.status === 'upcoming' || row.status === 'active' || row.status === 'ended');
-  const chain = readChain ? await getChainSnapshot(row.pool_address!) : null;
+
+  // Fast path: pure time window flip without chain reads
+  if (!row.pool_address) {
+    const nextBare = computeNextStatus(row, null, nowMs);
+    if (nextBare !== row.status) {
+      await supabase.from('launches')
+        .update({ status: nextBare, updated_at: new Date().toISOString() })
+        .eq('id', row.id);
+      log.info({ id: row.id, from: row.status, to: nextBare }, 'status reconciled (time-only)');
+    }
+    return nextBare;
+  }
+
+  // Only hit chain when the row is 'upcoming'/'active'/'ended'
+  const needsChain = row.status === 'upcoming' || row.status === 'active' || row.status === 'ended';
+  const chain = needsChain ? await getChainSnapshot(row.pool_address) : null;
   const next = computeNextStatus(row, chain, nowMs);
 
   if (next !== row.status) {
-    const { error } = await supabase
-      .from('launches')
+    await supabase.from('launches')
       .update({ status: next, updated_at: new Date().toISOString() })
       .eq('id', row.id);
-    if (error) throw error;
     log.info({ id: row.id, from: row.status, to: next }, 'status reconciled');
   }
   return next;
@@ -512,31 +522,31 @@ function startRealtime() {
 
   return ch;
 }
-
 async function pollOnce() {
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from('launches')
     .select('id, pool_address, status, finalized, finalizing, finalize_attempts, start_at, end_at')
-    .in('status', ['draft', 'upcoming', 'active', 'ended'])
-    .limit(100);
+    .in('status', ['upcoming', 'active', 'ended'])
+    .limit(200);
 
-  if (error) {
-    log.error({ err: error }, 'poll query failed');
-    return;
-  }
+  const now = Date.now();
+  const soon = (r: any) => {
+    const end = r.end_at ? Date.parse(r.end_at) : Infinity;
+    return end - now <= 7_000; // ending within 7s
+  };
 
-  for (const r of data ?? []) {
-    const row = r as unknown as Launch;
-    try {
-      const next = await reconcileStatus(row);
-      if (next === 'ended' && !row.finalized && !(row as any).finalizing) {
-        await processOne({ ...row, status: next });
-      }
-    } catch (err) {
-      log.error({ err, id: row.id }, 'poll reconcile/process failed');
-    }
+  const hot = (data ?? []).filter(soon);
+  const cold = (data ?? []).filter((r) => !soon(r));
+
+  // Do "hot" rows first & in parallel (limit concurrency if many)
+  await Promise.all(hot.map((r) => reconcileStatus(r as any)));
+
+  // Then the rest (can be sequential or limited parallel)
+  for (const r of cold) {
+    await reconcileStatus(r as any);
   }
 }
+
 // top-level
 let _pollTimer: NodeJS.Timer | null = null;
 let _lastTick = Date.now();
