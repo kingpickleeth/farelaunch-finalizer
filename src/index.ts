@@ -29,6 +29,7 @@ const {
   CHAIN_ID = '1',
   PRIVATE_KEY,
   FACTORY_ADDRESS = '0x7d8c6B58BA2d40FC6E34C25f9A488067Fe0D2dB4', // Camelot AMM v2 (ApeChain)
+  PORT = '8080',
   POLL_INTERVAL_MS = '2000',
 } = process.env;
 
@@ -562,10 +563,10 @@ function startHttp() {
       res.status(500).json({ ok: false, error: e?.message || String(e) });
     }
   });
-  app.get('/', (_req, res) => res.status(200).send('ok'));
-  // catch-all 200 for GET to satisfy any default probe hitting '/' or another path
-  app.get('*', (_req, res) => res.status(200).send('ok'));
-  
+app.get('/', (_req, res) => res.status(200).send('ok'));
+// catch-all 200 for GET to satisfy any default probe hitting '/' or another path
+app.get('*', (_req, res) => res.status(200).send('ok'));
+
   // Manually trigger a sync() on a given pair (no swap)
   app.post('/sync-now', async (req: Request, res: Response) => {
     try {
