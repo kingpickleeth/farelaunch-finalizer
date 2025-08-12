@@ -29,7 +29,7 @@ const {
   CHAIN_ID = '1',
   PRIVATE_KEY,
   FACTORY_ADDRESS = '0x7d8c6B58BA2d40FC6E34C25f9A488067Fe0D2dB4', // Camelot AMM v2 (ApeChain)
-  POLL_INTERVAL_MS = '10001',
+  POLL_INTERVAL_MS = '3500',
 } = process.env;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !RPC_URL || !PRIVATE_KEY) {
@@ -539,7 +539,7 @@ async function pollOnce() {
 }
 
 function startPoller() {
-  const ms = Number(POLL_INTERVAL_MS || 10001);
+  const ms = Number(POLL_INTERVAL_MS || 3500);
   log.info({ ms }, 'starting poller');
   setInterval(() => {
     pollOnce().catch((err) => log.error({ err }, 'pollOnce failed'));
