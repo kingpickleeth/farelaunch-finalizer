@@ -65,7 +65,7 @@ const walletClient = createWalletClient({ account, chain, transport: http(RPC_UR
 // ---------- ABIs ----------
 const presalePoolAbi = parseAbi([
   'function finalize() external',
-  'function refund() external', 
+  'function refund() external',
   'function finalized() view returns (bool)',
   'function softCap() view returns (uint256)',
   'function hardCap() view returns (uint256)',
@@ -173,7 +173,8 @@ async function reconcileStatus(row: Launch): Promise<Status> {
   if (!row.pool_address) {
     const nextBare = computeNextStatus(row, null, nowMs);
     if (nextBare !== row.status) {
-      await supabase.from('launches')
+      await supabase
+        .from('launches')
         .update({ status: nextBare, updated_at: new Date().toISOString() })
         .eq('id', row.id);
       log.info({ id: row.id, from: row.status, to: nextBare }, 'status reconciled (time-only)');
@@ -183,11 +184,12 @@ async function reconcileStatus(row: Launch): Promise<Status> {
 
   // Only hit chain when the row is 'upcoming'/'active'/'ended'
   const needsChain = row.status === 'upcoming' || row.status === 'active' || row.status === 'ended';
-  const chain = needsChain ? await getChainSnapshot(row.pool_address) : null;
-  const next = computeNextStatus(row, chain, nowMs);
+  const chainSnap = needsChain ? await getChainSnapshot(row.pool_address) : null;
+  const next = computeNextStatus(row, chainSnap, nowMs);
 
   if (next !== row.status) {
-    await supabase.from('launches')
+    await supabase
+      .from('launches')
       .update({ status: next, updated_at: new Date().toISOString() })
       .eq('id', row.id);
     log.info({ id: row.id, from: row.status, to: next }, 'status reconciled');
@@ -199,8 +201,9 @@ async function reconcileStatus(row: Launch): Promise<Status> {
 async function checkFinalizeEligibility(pool: `0x${string}`) {
   const s = await getChainSnapshot(pool);
   const canFinalize =
-    (!s.finalized && !s.failed) &&
-    ((s.totalRaised >= s.softCap && s.now >= Number(s.endAt)) || (s.totalRaised >= s.hardCap));
+    !s.finalized &&
+    !s.failed &&
+    ((s.totalRaised >= s.softCap && s.now >= Number(s.endAt)) || s.totalRaised >= s.hardCap);
   return { ...s, canFinalize };
 }
 
@@ -213,7 +216,13 @@ async function callFinalize(pool: `0x${string}`): Promise<{ hash: `0x${string}`;
 
   if (!st.canFinalize && afterEnd && belowSoft && !st.finalized && !st.failed) {
     log.info(
-      { pool, totalRaised: st.totalRaised.toString(), softCap: st.softCap.toString(), endAt: st.endAt.toString(), now: st.now },
+      {
+        pool,
+        totalRaised: st.totalRaised.toString(),
+        softCap: st.softCap.toString(),
+        endAt: st.endAt.toString(),
+        now: st.now,
+      },
       'preflight: mark failed (below soft cap after end)',
     );
     const err = new Error('SALE_FAILED_BELOW_SOFTCAP');
@@ -263,6 +272,7 @@ async function callFinalize(pool: `0x${string}`): Promise<{ hash: `0x${string}`;
     throw e;
   }
 }
+
 // ---------- Refund preflight & call ----------
 async function checkRefundEligibility(pool: `0x${string}`) {
   const s = await getChainSnapshot(pool);
@@ -342,7 +352,9 @@ async function pairsFromFinalizeReceipt(receipt: any): Promise<`0x${string}`[]> 
         }
       }
     }
-  } catch {/* ignore */}
+  } catch {
+    /* ignore */
+  }
 
   // Mint/Sync (covers pre-existing pairs that got liquidity/sync)
   try {
@@ -356,7 +368,9 @@ async function pairsFromFinalizeReceipt(receipt: any): Promise<`0x${string}`[]> 
       const addr = (ev as any)?.address as `0x${string}` | undefined; // log.address is pair
       if (addr) pairs.add(addr);
     }
-  } catch {/* ignore */}
+  } catch {
+    /* ignore */
+  }
 
   return [...pairs];
 }
@@ -414,7 +428,6 @@ function markDone(id: string) {
   processing.delete(id);
 }
 
-// ---------- DB lock & finalize pipeline ----------
 // ---------- DB lock & finalize/refund pipeline ----------
 async function tryClaim(id: string, mode: 'finalize' | 'refund'): Promise<boolean> {
   let q = supabase
@@ -438,10 +451,9 @@ async function tryClaim(id: string, mode: 'finalize' | 'refund'): Promise<boolea
   return !!data;
 }
 
-
 async function processOne(row: Launch) {
   if (!row.pool_address) {
-    log.warn({ id: row.id }, 'no pool_address; skipping');
+    log.debug({ id: row.id }, 'no pool_address; skipping'); // quieter
     return;
   }
   if (!markStart(row.id)) {
@@ -456,7 +468,7 @@ async function processOne(row: Launch) {
     // Reconcile first
     const nextStatus = await reconcileStatus(row);
 
-    // NEW: refund path if sale ended below soft cap (status = 'failed')
+    // Refund path if sale ended below soft cap (status = 'failed')
     if (nextStatus === 'failed') {
       const claimed = await tryClaim(id, 'refund');
       if (!claimed) {
@@ -470,7 +482,6 @@ async function processOne(row: Launch) {
         const { error } = await supabase
           .from('launches')
           .update({
-            // still failed; just mark the attempt as successful and clear lock/error
             finalizing: false,
             finalize_attempts: (row.finalize_attempts ?? 0) + 1,
             finalize_error: null,
@@ -494,7 +505,7 @@ async function processOne(row: Launch) {
       return;
     }
 
-    // Existing finalize path (unchanged, except tryClaim call below)
+    // Finalize path
     if (nextStatus !== 'ended') {
       log.info({ id, nextStatus }, 'no finalize/refund needed after reconcile');
       return;
@@ -557,13 +568,11 @@ async function processOne(row: Launch) {
     if (error) throw error;
 
     log.info({ id, pool, tx: hash, attempts, already }, 'finalized');
-
   } catch (e: any) {
     const saleFailed = e && e.__saleFailed === true;
 
     log.error({ id, pool, err: e?.message || String(e) }, 'finalize failed');
 
-    // Keep one update object and finalize it later
     const update: any = {
       finalizing: false,
       finalize_attempts: (row.finalize_attempts ?? 0) + 1,
@@ -571,8 +580,6 @@ async function processOne(row: Launch) {
       updated_at: new Date().toISOString(),
     };
 
-    // If we intentionally flagged the sale as "below soft cap after end",
-    // run REFUND right here under the same lock (so we don't rely on a second trigger)
     if (saleFailed) {
       try {
         const { hash: refundHash } = await callRefund(pool);
@@ -595,8 +602,6 @@ async function processOne(row: Launch) {
 }
 
 // ---------- Realtime & Poller ----------
-
-// (optional) auto re-subscribe if realtime drops
 function startRealtime() {
   const ch = supabase
     .channel('launches-status')
@@ -606,6 +611,12 @@ function startRealtime() {
       async (payload) => {
         const next = payload.new as Launch | undefined;
         if (!next) return;
+
+        // 🔒 Ignore rows without a pool to prevent log spam / useless processing
+        if (!next.pool_address) {
+          log.debug({ id: next.id }, 'RT: no pool_address; ignoring');
+          return;
+        }
 
         try {
           const reconciled = await reconcileStatus({
@@ -620,11 +631,11 @@ function startRealtime() {
           });
 
           if (
-            (reconciled === 'ended' || reconciled === 'failed') &&   // <-- ADD 'failed' here
+            (reconciled === 'ended' || reconciled === 'failed') &&
             next.finalized === false &&
             (next as any).finalizing === false
           ) {
-            log.info({ id: next.id }, 'RT: ended → process');
+            log.info({ id: next.id }, `RT: ${reconciled} → process`);
             processOne({
               id: next.id,
               status: reconciled,
@@ -647,7 +658,6 @@ function startRealtime() {
       if (status === 'CLOSED' || status === 'TIMED_OUT') {
         log.warn({ status }, 'realtime closed, retrying in 2s');
         setTimeout(() => {
-          // keep a strong ref if you store it globally
           _realtime = startRealtime();
         }, 2000);
       }
@@ -661,6 +671,7 @@ async function pollOnce() {
     .from('launches')
     .select('id, pool_address, status, finalized, finalizing, finalize_attempts, start_at, end_at')
     .in('status', ['upcoming', 'active', 'ended'])
+    .not('pool_address', 'is', null) // skip rows without pools
     .limit(200);
 
   const now = Date.now();
@@ -710,7 +721,6 @@ function startHttp() {
   app.use(express.json());
 
   // Health
-  // inside startHttp(), before app.listen(...)
   app.get('/health', async (_req: Request, res: Response) => {
     try {
       const { error } = await supabase.from('launches').select('id').limit(1);
@@ -720,9 +730,9 @@ function startHttp() {
       res.status(500).json({ ok: false, error: e?.message || String(e) });
     }
   });
-app.get('/', (_req, res) => res.status(200).send('ok'));
-// catch-all 200 for GET to satisfy any default probe hitting '/' or another path
-app.get('*', (_req, res) => res.status(200).send('ok'));
+  app.get('/', (_req, res) => res.status(200).send('ok'));
+  // catch-all 200 for GET to satisfy any default probe hitting '/' or another path
+  app.get('*', (_req, res) => res.status(200).send('ok'));
 
   // Manually trigger a sync() on a given pair (no swap)
   app.post('/sync-now', async (req: Request, res: Response) => {
@@ -778,6 +788,7 @@ app.get('*', (_req, res) => res.status(200).send('ok'));
     log.info({ port, addr: account.address }, 'health server up');
   });
 }
+
 process.on('unhandledRejection', (reason) => log.fatal({ reason }, 'unhandledRejection'));
 process.on('uncaughtException', (err) => log.fatal({ err }, 'uncaughtException'));
 process.on('exit', (code) => log.warn({ code }, 'process exit'));
