@@ -124,6 +124,19 @@ async function sweepRefundBatch(pool) {
     }
     return "noop";
 }
+async function isRefundComplete(pool) {
+    try {
+        const [failed, refundedAll] = await Promise.all([
+            publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'failed' }),
+            publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'refundedAll' }),
+        ]);
+        return failed && refundedAll;
+    }
+    catch {
+        // Old impl: no refundedAll() — we can't know it's “done”; treat as not complete
+        return false;
+    }
+}
 // ---------- Status logic ----------
 function computeNextStatus(row, chain, nowMs) {
     if (row.status === 'finalized')
@@ -448,6 +461,17 @@ const RT_COOLDOWN_MS = Number(process.env.RT_COOLDOWN_MS || 30_000);
 const _rtLast = new Map();
 const REFUND_SWEEP_COOLDOWN_MS = Number(process.env.REFUND_SWEEP_COOLDOWN_MS || 60_000); // 60s default
 const _lastRefundSweep = new Map();
+const REFUND_DONE_CACHE_MS = Number(process.env.REFUND_DONE_CACHE_MS || 60_000);
+const _refundDoneCache = new Map();
+async function isRefundCompleteCached(pool) {
+    const hit = _refundDoneCache.get(pool);
+    const now = Date.now();
+    if (hit && now - hit.t < REFUND_DONE_CACHE_MS)
+        return hit.done;
+    const done = await isRefundComplete(pool);
+    _refundDoneCache.set(pool, { t: now, done });
+    return done;
+}
 // ---------- DB lock & finalize/refund pipeline ----------
 async function tryClaim(id, mode) {
     let q = supabase
