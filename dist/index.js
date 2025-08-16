@@ -3,7 +3,7 @@ import 'dotenv/config';
 import express from 'express';
 import pino from 'pino';
 import { createClient as createSb } from '@supabase/supabase-js';
-import { createPublicClient, createWalletClient, http, parseAbi, parseEventLogs, getAddress, defineChain, } from 'viem';
+import { createPublicClient, createWalletClient, http, parseAbi, parseEventLogs, getAddress, defineChain, parseUnits, } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 // ---------- Logging ----------
 const log = pino({
@@ -21,6 +21,11 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !RPC_URL || !PRIVATE_KEY) {
         PRIVATE_KEY: !!PRIVATE_KEY,
     }, 'Missing required env vars');
     process.exit(1);
+}
+const { WAPE_ADDRESS, CAMELOT_V2_ROUTER, MICRO_BUY_ENABLED = 'true', MICRO_BUY_DELAY_MS = '15000', MICRO_BUY_WAPE = '0.0001', MICRO_BUY_DEADLINE_SECONDS = '600', } = process.env;
+const MICRO_OK = !!WAPE_ADDRESS && !!CAMELOT_V2_ROUTER && MICRO_BUY_ENABLED !== 'false';
+if (!MICRO_OK) {
+    log.warn({ WAPE_ADDRESS: !!WAPE_ADDRESS, CAMELOT_V2_ROUTER: !!CAMELOT_V2_ROUTER, MICRO_BUY_ENABLED }, 'micro-buy disabled (missing envs or disabled)');
 }
 // ---------- Supabase ----------
 const supabase = createSb(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
@@ -58,6 +63,27 @@ const v2PairAbi = parseAbi([
     'function sync() external',
     'event Mint(address indexed sender, uint256 amount0, uint256 amount1)',
     'event Sync(uint112 reserve0, uint112 reserve1)',
+    'function token0() view returns (address)',
+    'function token1() view returns (address)',
+]);
+// Minimal ERC20 + WAPE (deposit)
+const erc20Abi = parseAbi([
+    'function balanceOf(address) view returns (uint256)',
+    'function allowance(address owner, address spender) view returns (uint256)',
+    'function approve(address spender, uint256 value) returns (bool)',
+    'function decimals() view returns (uint8)',
+    'function symbol() view returns (string)',
+]);
+const wapeAbi = parseAbi([
+    'function deposit() payable', // wrap native APE -> WAPE
+    'function withdraw(uint256)', // not used, but handy
+    'function balanceOf(address) view returns (uint256)',
+    'function allowance(address owner, address spender) view returns (uint256)',
+    'function approve(address spender, uint256 value) returns (bool)',
+]);
+// Camelot v2 router (supports fee-on-transfer tokens)
+const camelotV2RouterAbi = parseAbi([
+    'function swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline) external',
 ]);
 // ---------- Helpers ----------
 async function readFinalized(pool) {
@@ -446,6 +472,117 @@ async function kickScreenersWithSync(pairs, txHash) {
         }
     }
 }
+// ---------- Micro-buy helpers ----------
+const _microBuyScheduled = new Set(); // pair -> scheduled
+async function wrapApeToWapeIfNeeded(target) {
+    if (!MICRO_OK)
+        return;
+    const wape = WAPE_ADDRESS;
+    const bal = (await publicClient.readContract({
+        address: wape,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [account.address],
+    }));
+    if (bal >= target)
+        return;
+    const missing = target - bal;
+    const hash = await walletClient.writeContract({
+        address: wape,
+        abi: wapeAbi,
+        functionName: 'deposit',
+        account,
+        chain,
+        // send native APE to wrap
+        value: missing,
+    });
+    const r = await publicClient.waitForTransactionReceipt({ hash });
+    if (r.status !== 'success')
+        throw new Error(`WAPE deposit failed: ${hash}`);
+    log.info({ missing: missing.toString(), hash }, 'wrapped APE -> WAPE');
+}
+async function approveIfNeeded(token, spender, min) {
+    const cur = (await publicClient.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [account.address, spender],
+    }));
+    if (cur >= min)
+        return;
+    const hash = await walletClient.writeContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'approve',
+        args: [spender, min],
+        account,
+        chain,
+    });
+    const r = await publicClient.waitForTransactionReceipt({ hash });
+    if (r.status !== 'success')
+        throw new Error(`approve failed: ${hash}`);
+    log.info({ token, spender, amount: min.toString(), hash }, 'approved router');
+}
+async function readPairTokens(pair) {
+    const [t0, t1] = await Promise.all([
+        publicClient.readContract({ address: pair, abi: v2PairAbi, functionName: 'token0' }),
+        publicClient.readContract({ address: pair, abi: v2PairAbi, functionName: 'token1' }),
+    ]);
+    return { token0: getAddress(t0), token1: getAddress(t1) };
+}
+async function microBuyOnPair(pair) {
+    if (!MICRO_OK)
+        return;
+    const pairCk = getAddress(pair); // normalize
+    const router = CAMELOT_V2_ROUTER;
+    const wape = getAddress(WAPE_ADDRESS);
+    const wapeDecimals = 18; // or read dynamically (see tip #3 below)
+    const amountIn = parseUnits(MICRO_BUY_WAPE, wapeDecimals);
+    const deadline = Math.floor(Date.now() / 1000) + Number(MICRO_BUY_DEADLINE_SECONDS);
+    const { token0, token1 } = await readPairTokens(pairCk);
+    let other = null;
+    if (token0.toLowerCase() === wape.toLowerCase())
+        other = token1;
+    if (token1.toLowerCase() === wape.toLowerCase())
+        other = token0;
+    if (!other) {
+        log.info({ pair: pairCk, token0, token1, wape }, 'micro-buy skipped: pair does not contain WAPE');
+        return;
+    }
+    await wrapApeToWapeIfNeeded(amountIn);
+    await approveIfNeeded(wape, router, amountIn);
+    const path = [wape, other];
+    const sim = await publicClient.simulateContract({
+        address: router,
+        abi: camelotV2RouterAbi,
+        functionName: 'swapExactTokensForTokensSupportingFeeOnTransferTokens',
+        args: [amountIn, 0n, path, account.address, BigInt(deadline)],
+        account,
+    });
+    const hash = await walletClient.writeContract(sim.request);
+    const r = await publicClient.waitForTransactionReceipt({ hash });
+    if (r.status !== 'success')
+        throw new Error(`micro-buy swap failed: ${hash}`);
+    log.info({ pair: pairCk, path, amountIn: MICRO_BUY_WAPE, hash }, 'micro-buy executed');
+}
+function scheduleMicroBuyAfterFinalize(pairs) {
+    if (!MICRO_OK)
+        return;
+    const delay = Math.max(0, Number(MICRO_BUY_DELAY_MS));
+    for (const p of pairs) {
+        const pair = getAddress(p);
+        if (_microBuyScheduled.has(pair))
+            continue; // schedule once per runtime
+        _microBuyScheduled.add(pair);
+        setTimeout(() => {
+            microBuyOnPair(pair).catch((e) => {
+                log.warn({ pair, err: e?.message || String(e) }, 'micro-buy failed');
+                _microBuyScheduled.delete(pair); // allow retry if you want to call it again later
+            });
+        }, delay);
+        log.info({ pair, delayMs: delay }, 'micro-buy scheduled');
+    }
+}
 // ---------- Concurrency guards ----------
 const processing = new Set();
 function markStart(id) {
@@ -640,6 +777,8 @@ async function processOne(row) {
                     if (pairs.length) {
                         log.info({ pool, pairs }, 'finalize detected pairs; syncing…');
                         await kickScreenersWithSync(pairs, txHash);
+                        if (pairs.length)
+                            scheduleMicroBuyAfterFinalize(pairs);
                     }
                     else {
                         log.warn({ pool, tx: txHash }, 'no PairCreated/Mint/Sync logs found in finalize receipt');
@@ -961,6 +1100,23 @@ function startHttp() {
                 return res.status(404).json({ ok: false, error: 'Row not found' });
             await processOne(data);
             res.json({ ok: true });
+        }
+        catch (e) {
+            res.status(500).json({ ok: false, error: e?.message || String(e) });
+        }
+    });
+    // --- DEBUG: trigger micro-buy now for a given pair (optional ?amount=0.00005) ---
+    app.post('/debug/microbuy-now', async (req, res) => {
+        try {
+            const pair = String(req.query.pair || '').toLowerCase();
+            const amt = String(req.query.amount || '').trim();
+            if (!pair || !pair.startsWith('0x') || pair.length !== 42) {
+                return res.status(400).json({ ok: false, error: 'Missing/invalid ?pair=0x...' });
+            }
+            if (amt)
+                process.env.MICRO_BUY_WAPE = amt; // override this run
+            await microBuyOnPair(pair);
+            res.json({ ok: true, pair, amount: amt || MICRO_BUY_WAPE });
         }
         catch (e) {
             res.status(500).json({ ok: false, error: e?.message || String(e) });
