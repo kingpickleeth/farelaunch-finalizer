@@ -86,9 +86,8 @@ async function getChainSnapshot(pool) {
 }
 async function sweepRefundBatch(pool) {
     const BATCH = Number(process.env.REFUND_BATCH || 200);
-    // Try reading refundedAll(); if the pool is old (no function), readContract will throw.
-    let isFailed = false;
-    let isDone = false;
+    // Try to read gates; old impls may not have refundedAll()
+    let isFailed = false, isDone = false;
     try {
         const [failed, refundedAll] = await Promise.all([
             publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'failed' }),
@@ -98,11 +97,13 @@ async function sweepRefundBatch(pool) {
         isDone = refundedAll;
     }
     catch {
-        // Old pool impl: no refundedAll(). Just return; backend can still optionally call refund() for itself.
-        return;
+        // Old pool impl: no refundedAll(). Nothing we can sweep here.
+        return "noop";
     }
-    if (!isFailed || isDone)
-        return;
+    if (!isFailed)
+        return "noop";
+    if (isDone)
+        return "done";
     try {
         const hash = await walletClient.writeContract({
             address: pool,
@@ -115,11 +116,13 @@ async function sweepRefundBatch(pool) {
         const r = await publicClient.waitForTransactionReceipt({ hash });
         if (r.status === 'success') {
             log.info({ pool, hash, batch: BATCH }, 'refundAllRemaining batch submitted');
+            return "submitted";
         }
     }
     catch (e) {
         log.warn({ pool, err: e?.shortMessage || e?.message || String(e) }, 'refundAllRemaining failed (will try later)');
     }
+    return "noop";
 }
 // ---------- Status logic ----------
 function computeNextStatus(row, chain, nowMs) {
@@ -255,7 +258,7 @@ async function callMarkFailed(pool) {
     const s = await getChainSnapshot(pool);
     const afterEnd = s.now >= Number(s.endAt);
     const belowSoft = s.totalRaised < s.softCap;
-    log.info({ pool, afterEnd, belowSoft, failed: s.failed }, 'callMarkFailed preflight');
+    log.debug({ pool, afterEnd, belowSoft, failed: s.failed }, 'callMarkFailed preflight');
     if (s.failed)
         return null;
     if (!afterEnd || !belowSoft)
@@ -298,7 +301,7 @@ async function ensureFailedOnChain(pool) {
     const s = await getChainSnapshot(pool);
     const afterEnd = s.now >= Number(s.endAt);
     const belowSoft = s.totalRaised < s.softCap;
-    log.info({ pool, failed: s.failed, afterEnd, belowSoft, now: s.now, endAt: Number(s.endAt) }, 'ensureFailedOnChain snapshot');
+    log.debug({ pool, failed: s.failed, afterEnd, belowSoft, now: s.now, endAt: Number(s.endAt) }, 'ensureFailedOnChain snapshot');
     if (s.failed)
         return true;
     if (!afterEnd || !belowSoft)
@@ -443,6 +446,8 @@ function markDone(id) {
 }
 const RT_COOLDOWN_MS = Number(process.env.RT_COOLDOWN_MS || 30_000);
 const _rtLast = new Map();
+const REFUND_SWEEP_COOLDOWN_MS = Number(process.env.REFUND_SWEEP_COOLDOWN_MS || 60_000); // 60s default
+const _lastRefundSweep = new Map();
 // ---------- DB lock & finalize/refund pipeline ----------
 async function tryClaim(id, mode) {
     let q = supabase
@@ -496,27 +501,60 @@ async function processOne(row) {
             }
             try {
                 // Enforce eligibility *again* inside the lock, and branch on the boolean
-                eligible = await ensureFailedOnChain(pool);
+                // Enforce eligibility *again* inside the lock
+                eligible = await ensureFailedOnChain(pool); // ← reassign, do NOT redeclare
                 if (!eligible) {
-                    // Not eligible yet: don’t sweep, record & exit cleanly
                     await supabase.from('launches').update({
                         finalizing: false,
-                        finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+                        finalize_attempts: row.finalize_attempts ?? 0,
                         finalize_error: 'NOT_ELIGIBLE_TO_MARK_FAILED_YET',
                         updated_at: new Date().toISOString(),
                     }).eq('id', id);
-                    log.info({ id, pool }, 'skipping sweep: failed flag not set yet');
+                    log.debug({ id, pool }, 'skipping sweep: failed flag not set yet');
                     return;
                 }
-                // Now it is failed on-chain: sweep
-                await sweepRefundBatch(pool);
-                await supabase.from('launches').update({
-                    finalizing: false,
-                    finalize_attempts: (row.finalize_attempts ?? 0) + 1,
-                    finalize_error: null,
-                    updated_at: new Date().toISOString(),
-                }).eq('id', id);
-                log.info({ id, pool }, 'refund sweep tick executed');
+                // Cooldown to avoid hammering the same pool
+                const last = _lastRefundSweep.get(pool) || 0;
+                if (Date.now() - last < REFUND_SWEEP_COOLDOWN_MS) {
+                    await supabase.from('launches').update({
+                        finalizing: false,
+                        finalize_attempts: row.finalize_attempts ?? 0,
+                        finalize_error: null,
+                        updated_at: new Date().toISOString(),
+                    }).eq('id', id);
+                    log.debug({ id, pool }, 'refund sweep cooled down; skipping');
+                    return;
+                }
+                // Do one sweep attempt
+                const sweep = await sweepRefundBatch(pool); // returns "submitted" | "done" | "noop"
+                if (sweep === 'submitted') {
+                    _lastRefundSweep.set(pool, Date.now());
+                    await supabase.from('launches').update({
+                        finalizing: false,
+                        finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+                        finalize_error: null,
+                        updated_at: new Date().toISOString(),
+                    }).eq('id', id);
+                    log.info({ id, pool }, 'refund sweep tick executed');
+                }
+                else if (sweep === 'done') {
+                    await supabase.from('launches').update({
+                        finalizing: false,
+                        finalize_error: null,
+                        updated_at: new Date().toISOString(),
+                    }).eq('id', id);
+                    log.info({ id, pool }, 'refund sweep complete');
+                }
+                else {
+                    // "noop" — nothing to do (old impl or already attempted and not yet ready)
+                    await supabase.from('launches').update({
+                        finalizing: false,
+                        finalize_error: null,
+                        updated_at: new Date().toISOString(),
+                    }).eq('id', id);
+                    log.debug({ id, pool }, 'refund sweep noop');
+                }
+                return;
             }
             catch (e) {
                 const errMsg = e?.shortMessage || e?.message || String(e);
