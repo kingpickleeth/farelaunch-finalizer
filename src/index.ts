@@ -65,6 +65,7 @@ const walletClient = createWalletClient({ account, chain, transport: http(RPC_UR
 // ---------- ABIs ----------
 const presalePoolAbi = parseAbi([
   'function finalize() external',
+  'function markFailed() external',       // <-- added
   'function refund() external',
   'function finalized() view returns (bool)',
   'function softCap() view returns (uint256)',
@@ -207,7 +208,6 @@ async function checkFinalizeEligibility(pool: `0x${string}`) {
   return { ...s, canFinalize };
 }
 
-/** Return both tx hash and receipt so we can parse logs for PairCreated/Mint/Sync */
 async function callFinalize(pool: `0x${string}`): Promise<{ hash: `0x${string}`; receipt: any }> {
   const st = await checkFinalizeEligibility(pool);
 
@@ -273,37 +273,61 @@ async function callFinalize(pool: `0x${string}`): Promise<{ hash: `0x${string}`;
   }
 }
 
-// ---------- Refund preflight & call ----------
-async function checkRefundEligibility(pool: `0x${string}`) {
+// ---------- markFailed & Refund helpers ----------
+async function callMarkFailed(pool: `0x${string}`): Promise<`0x${string}` | null> {
   const s = await getChainSnapshot(pool);
   const afterEnd = s.now >= Number(s.endAt);
   const belowSoft = s.totalRaised < s.softCap;
 
-  // Refund is okay if:
-  // - sale is not finalized, and
-  // - the contract already marks it failed, OR it's after end AND below soft cap.
-  const canRefund = !s.finalized && (s.failed || (afterEnd && belowSoft));
-  return { ...s, canRefund, afterEnd, belowSoft };
+  if (s.failed) {
+    return null; // already failed
+  }
+  if (!afterEnd || !belowSoft) {
+    throw new Error('NotFailed window not met');
+  }
+
+  const hash = await walletClient.writeContract({
+    address: pool,
+    abi: presalePoolAbi,
+    functionName: 'markFailed',
+    chain,
+    account,
+  });
+  const r = await publicClient.waitForTransactionReceipt({ hash });
+  if (r.status !== 'success') throw new Error(`markFailed tx failed: ${hash}`);
+  log.info({ pool, hash }, 'markFailed() confirmed');
+  return hash;
 }
 
-async function callRefund(pool: `0x${string}`): Promise<{ hash: `0x${string}`; receipt: any }> {
-  const st = await checkRefundEligibility(pool);
+async function ensureFailedOnChain(pool: `0x${string}`): Promise<boolean> {
+  const s = await getChainSnapshot(pool);
+  if (s.failed) return true;
+  const afterEnd = s.now >= Number(s.endAt);
+  const belowSoft = s.totalRaised < s.softCap;
+  if (!afterEnd || !belowSoft) return false;
+  await callMarkFailed(pool);
+  return true;
+}
 
-  if (!st.canRefund) {
+async function callRefund(pool: `0x${string}`): Promise<{ hash: `0x${string}` | null; receipt: any | null }> {
+  // Ensure the on-chain failed flag is set (will send markFailed if eligible)
+  const ok = await ensureFailedOnChain(pool);
+  if (!ok) {
+    const s = await getChainSnapshot(pool);
     log.info(
       {
         pool,
-        reason: 'not_eligible',
-        totalRaised: st.totalRaised.toString(),
-        softCap: st.softCap.toString(),
-        endAt: st.endAt.toString(),
-        now: st.now,
-        finalized: st.finalized,
-        failed: st.failed,
+        reason: 'not_failed_yet',
+        totalRaised: s.totalRaised.toString(),
+        softCap: s.softCap.toString(),
+        endAt: s.endAt.toString(),
+        now: s.now,
+        finalized: s.finalized,
+        failed: s.failed,
       },
-      'preflight: skip refund',
+      'preflight: skip refund (failed flag not set/eligible)',
     );
-    throw new Error('Refund not eligible yet (Window)');
+    throw new Error('Refund not eligible yet (Failed flag not set)');
   }
 
   try {
@@ -318,14 +342,15 @@ async function callRefund(pool: `0x${string}`): Promise<{ hash: `0x${string}`; r
     if (receipt.status !== 'success') throw new Error(`Refund tx failed: ${hash}`);
     return { hash, receipt };
   } catch (e: any) {
-    const data = e?.data || e?.cause?.data;
-    const sel = typeof data === 'string' ? data.slice(0, 10) : undefined;
-    if (sel === '0x86997fcd') {
-      log.warn({ pool, selector: sel, msg: e?.shortMessage || e?.message }, 'refund reverted: Window()');
-    } else if (sel) {
-      log.warn({ pool, selector: sel, msg: e?.shortMessage || e?.message }, 'refund reverted: custom error');
-    } else {
-      log.warn({ pool, msg: e?.shortMessage || e?.message }, 'refund reverted');
+    const msg = e?.shortMessage || e?.message || String(e);
+    // Contract uses: require(amt > 0, "nothing")
+    if (typeof msg === 'string' && msg.toLowerCase().includes('nothing')) {
+      // Backend wallet had no contribution — treat as no-op
+      (e as any).__noContribution = true;
+    }
+    // If still "not failed", surface clearly
+    if (typeof msg === 'string' && msg.toLowerCase().includes('not failed')) {
+      (e as any).__notFailed = true;
     }
     throw e;
   }
@@ -476,7 +501,7 @@ async function processOne(row: Launch) {
         return;
       }
 
-      // Attempt refund (idempotent via on-chain guards)
+      // Ensure on-chain failed flag, then attempt refund (idempotent; may be "nothing")
       try {
         const { hash } = await callRefund(pool);
         const { error } = await supabase
@@ -491,16 +516,30 @@ async function processOne(row: Launch) {
         if (error) throw error;
         log.info({ id, pool, tx: hash }, 'refund executed');
       } catch (e: any) {
-        log.error({ id, pool, err: e?.message || String(e) }, 'refund failed');
-        await supabase
-          .from('launches')
-          .update({
-            finalizing: false,
-            finalize_attempts: (row.finalize_attempts ?? 0) + 1,
-            finalize_error: `REFUND_FAILED: ${e?.message || String(e)}`,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', id);
+        if (e && e.__noContribution) {
+          // No contribution for this wallet; treat as success/no-op
+          log.info({ id, pool }, 'refund skipped: backend wallet has no contribution');
+          await supabase
+            .from('launches')
+            .update({
+              finalizing: false,
+              finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+              finalize_error: null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', id);
+        } else {
+          log.error({ id, pool, err: e?.message || String(e) }, 'refund failed');
+          await supabase
+            .from('launches')
+            .update({
+              finalizing: false,
+              finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+              finalize_error: `REFUND_FAILED: ${e?.message || String(e)}`,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', id);
+        }
       }
       return;
     }
@@ -580,18 +619,32 @@ async function processOne(row: Launch) {
       updated_at: new Date().toISOString(),
     };
 
+    // If we intentionally flagged the sale as "below soft cap after end",
+    // set failed on-chain, then attempt refund (may be no-op)
     if (saleFailed) {
+      try {
+        await callMarkFailed(pool);
+      } catch (mfErr: any) {
+        log.warn({ id, pool, err: mfErr?.message || String(mfErr) }, 'markFailed attempt (from finalize preflight) failed or not needed');
+      }
       try {
         const { hash: refundHash } = await callRefund(pool);
         log.info({ id, pool, tx: refundHash }, 'refund executed (from finalize preflight)');
         update.status = 'failed';
         update.finalized = false;
-        update.finalize_error = null; // refund succeeded; clear error
+        update.finalize_error = null; // refund succeeded/no-op; clear error
       } catch (er: any) {
-        log.error({ id, pool, err: er?.message || String(er) }, 'refund attempt failed (from finalize preflight)');
-        update.status = 'failed';
-        update.finalized = false;
-        update.finalize_error = `REFUND_FAILED: ${er?.message || String(er)}`;
+        if (er && er.__noContribution) {
+          log.info({ id, pool }, 'refund skipped (no contribution) after markFailed');
+          update.status = 'failed';
+          update.finalized = false;
+          update.finalize_error = null;
+        } else {
+          log.error({ id, pool, err: er?.message || String(er) }, 'refund attempt failed (from finalize preflight)');
+          update.status = 'failed';
+          update.finalized = false;
+          update.finalize_error = `REFUND_FAILED: ${er?.message || String(er)}`;
+        }
       }
     }
 
@@ -670,7 +723,7 @@ async function pollOnce() {
   const { data } = await supabase
     .from('launches')
     .select('id, pool_address, status, finalized, finalizing, finalize_attempts, start_at, end_at')
-    .in('status', ['upcoming', 'active', 'ended'])
+    .in('status', ['upcoming', 'active', 'ended', 'failed']) // include failed so we can mark/refund
     .not('pool_address', 'is', null) // skip rows without pools
     .limit(200);
 
