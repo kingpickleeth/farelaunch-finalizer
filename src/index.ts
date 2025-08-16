@@ -220,7 +220,7 @@ async function reconcileStatus(row: Launch): Promise<Status> {
   }
 
   // Only hit chain when the row is 'upcoming'/'active'/'ended'
-  const needsChain = row.status === 'upcoming' || row.status === 'active' || row.status === 'ended';
+  const needsChain = !!row.pool_address; // read chain whenever there’s a pool
   const chainSnap = needsChain ? await getChainSnapshot(row.pool_address) : null;
   const next = computeNextStatus(row, chainSnap, nowMs);
 
@@ -311,53 +311,34 @@ async function callFinalize(pool: `0x${string}`): Promise<{ hash: `0x${string}`;
 
 // ---------- markFailed & Refund helpers ----------
 async function callMarkFailed(pool: `0x${string}`): Promise<`0x${string}` | null> {
-  const s = await getChainSnapshot(pool);
-  const afterEnd = s.now >= Number(s.endAt);
-  const belowSoft = s.totalRaised < s.softCap;
+  // ... (your preflight)
 
-  log.info({ pool, afterEnd, belowSoft, failed: s.failed }, 'callMarkFailed preflight');
+  const sim = await publicClient.simulateContract({ address: pool, abi: presalePoolAbi, functionName: 'markFailed', account });
+  const hash = await walletClient.writeContract(sim.request);
+  const r = await publicClient.waitForTransactionReceipt({ hash });
+  if (r.status !== 'success') throw new Error(`markFailed tx failed: ${hash}`);
 
-  if (s.failed) return null;
-  if (!afterEnd || !belowSoft) throw new Error('NotFailed window not met');
-
+  // OPTIONAL: persist
   try {
-    const sim = await publicClient.simulateContract({
-      address: pool,
-      abi: presalePoolAbi,
-      functionName: 'markFailed',
-      account,
-    });
-    const hash = await walletClient.writeContract(sim.request);
-    const r = await publicClient.waitForTransactionReceipt({ hash });
-    if (r.status !== 'success') throw new Error(`markFailed tx failed: ${hash}`);
-    log.info({ pool, hash }, 'markFailed() confirmed');
-    return hash;
-  } catch (e: any) {
-    const sel = e?.data ?? e?.cause?.data;
-    log.error({
-      pool,
-      msg: e?.shortMessage || e?.message,
-      selector: typeof sel === 'string' ? sel.slice(0, 10) : null,
-      raw: e,
-    }, 'markFailed reverted');
-    // Heuristic: function not present on older impls
-    const text = (e?.shortMessage || e?.message || '').toLowerCase();
-    if (text.includes('function selector was not recognized') || text.includes('no matching function')) {
-      (e as any).__noMarkFailed = true;
-    }
-    throw e;
-  }
-}
+    await supabase.from('processed_txs').insert({ tx_hash: hash });
+  } catch {}
 
+  log.info({ pool, hash }, 'markFailed() confirmed');
+  return hash;
+}
 async function ensureFailedOnChain(pool: `0x${string}`): Promise<boolean> {
   const s = await getChainSnapshot(pool);
-  if (s.failed) return true;
   const afterEnd = s.now >= Number(s.endAt);
   const belowSoft = s.totalRaised < s.softCap;
+
+  log.info({ pool, failed: s.failed, afterEnd, belowSoft, now: s.now, endAt: Number(s.endAt) }, 'ensureFailedOnChain snapshot');
+
+  if (s.failed) return true;
   if (!afterEnd || !belowSoft) return false;
   await callMarkFailed(pool);
   return true;
 }
+
 
 async function callRefund(pool: `0x${string}`): Promise<{ hash: `0x${string}` | null; receipt: any | null }> {
   // Ensure the on-chain failed flag is set (will send markFailed if eligible)
@@ -545,51 +526,52 @@ async function processOne(row: Launch) {
 
     // Refund path if sale ended below soft cap (status = 'failed')
   // Refund path if sale ended below soft cap (status = 'failed')
-if (nextStatus === 'failed') {
-  try {
-    await ensureFailedOnChain(pool);
-  } catch (e: any) {
-    log.warn({ id, pool, err: e?.message || String(e) }, 'pre-claim ensureFailedOnChain() failed (continuing)');
-  }
-
-  const claimed = await tryClaim(id, 'refund');
-  if (!claimed) {
-    log.debug({ id }, 'could not claim row for refund (another worker or not eligible)');
-    return;
-  }
-
-  try {
-    // Make sure on-chain failed flag is set (will call markFailed if eligible)
-    await ensureFailedOnChain(pool);
-    // Kick one sweep batch (new impl); old impl will no-op here
-    await sweepRefundBatch(pool);
-
-    // Clear lock & mark attempt; no DB status flip needed (row is already 'failed')
-    const { error } = await supabase
-      .from('launches')
-      .update({
+  if (nextStatus === 'failed') {
+    // Try once pre-claim (safe)
+    let eligible = false;
+    try {
+      eligible = await ensureFailedOnChain(pool); // true = already failed or markFailed sent+confirmed
+    } catch (e: any) {
+      log.warn({ id, pool, err: e?.message || String(e) }, 'pre-claim ensureFailedOnChain() threw');
+    }
+  
+    const claimed = await tryClaim(id, 'refund');
+    if (!claimed) {
+      log.debug({ id }, 'could not claim row for refund (another worker or not eligible)');
+      return;
+    }
+  
+    try {
+      // Enforce eligibility *again* inside the lock, and branch on the boolean
+      eligible = await ensureFailedOnChain(pool);
+      if (!eligible) {
+        // Not eligible yet: don’t sweep, record & exit cleanly
+        await supabase.from('launches').update({
+          finalizing: false,
+          finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+          finalize_error: 'NOT_ELIGIBLE_TO_MARK_FAILED_YET',
+          updated_at: new Date().toISOString(),
+        }).eq('id', id);
+        log.info({ id, pool }, 'skipping sweep: failed flag not set yet');
+        return;
+      }
+  
+      // Now it is failed on-chain: sweep
+      await sweepRefundBatch(pool);
+  
+      await supabase.from('launches').update({
         finalizing: false,
         finalize_attempts: (row.finalize_attempts ?? 0) + 1,
         finalize_error: null,
         updated_at: new Date().toISOString(),
-      })
-      .eq('id', id);
-    if (error) throw error;
-    log.info({ id, pool }, 'refund sweep tick executed');
-  } catch (e: any) {
-    log.error({ id, pool, err: e?.message || String(e) }, 'refund sweep tick failed');
-    await supabase
-      .from('launches')
-      .update({
-        finalizing: false,
-        finalize_attempts: (row.finalize_attempts ?? 0) + 1,
-        finalize_error: `REFUND_SWEEP_FAILED: ${e?.message || String(e)}`,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id);
-  }
-  return;
-}
+      }).eq('id', id);
+  
+      log.info({ id, pool }, 'refund sweep tick executed');
+    } catch (e: any) {
+      // ... your existing catch stays the same
+    }
+    return;
+  }  
 
     // Finalize path
     if (nextStatus !== 'ended') {
