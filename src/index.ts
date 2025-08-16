@@ -315,24 +315,38 @@ async function callMarkFailed(pool: `0x${string}`): Promise<`0x${string}` | null
   const afterEnd = s.now >= Number(s.endAt);
   const belowSoft = s.totalRaised < s.softCap;
 
-  if (s.failed) {
-    return null; // already failed
-  }
-  if (!afterEnd || !belowSoft) {
-    throw new Error('NotFailed window not met');
-  }
+  log.info({ pool, afterEnd, belowSoft, failed: s.failed }, 'callMarkFailed preflight');
 
-  const hash = await walletClient.writeContract({
-    address: pool,
-    abi: presalePoolAbi,
-    functionName: 'markFailed',
-    chain,
-    account,
-  });
-  const r = await publicClient.waitForTransactionReceipt({ hash });
-  if (r.status !== 'success') throw new Error(`markFailed tx failed: ${hash}`);
-  log.info({ pool, hash }, 'markFailed() confirmed');
-  return hash;
+  if (s.failed) return null;
+  if (!afterEnd || !belowSoft) throw new Error('NotFailed window not met');
+
+  try {
+    const sim = await publicClient.simulateContract({
+      address: pool,
+      abi: presalePoolAbi,
+      functionName: 'markFailed',
+      account,
+    });
+    const hash = await walletClient.writeContract(sim.request);
+    const r = await publicClient.waitForTransactionReceipt({ hash });
+    if (r.status !== 'success') throw new Error(`markFailed tx failed: ${hash}`);
+    log.info({ pool, hash }, 'markFailed() confirmed');
+    return hash;
+  } catch (e: any) {
+    const sel = e?.data ?? e?.cause?.data;
+    log.error({
+      pool,
+      msg: e?.shortMessage || e?.message,
+      selector: typeof sel === 'string' ? sel.slice(0, 10) : null,
+      raw: e,
+    }, 'markFailed reverted');
+    // Heuristic: function not present on older impls
+    const text = (e?.shortMessage || e?.message || '').toLowerCase();
+    if (text.includes('function selector was not recognized') || text.includes('no matching function')) {
+      (e as any).__noMarkFailed = true;
+    }
+    throw e;
+  }
 }
 
 async function ensureFailedOnChain(pool: `0x${string}`): Promise<boolean> {
@@ -532,6 +546,12 @@ async function processOne(row: Launch) {
     // Refund path if sale ended below soft cap (status = 'failed')
   // Refund path if sale ended below soft cap (status = 'failed')
 if (nextStatus === 'failed') {
+  try {
+    await ensureFailedOnChain(pool);
+  } catch (e: any) {
+    log.warn({ id, pool, err: e?.message || String(e) }, 'pre-claim ensureFailedOnChain() failed (continuing)');
+  }
+
   const claimed = await tryClaim(id, 'refund');
   if (!claimed) {
     log.debug({ id }, 'could not claim row for refund (another worker or not eligible)');
@@ -651,10 +671,14 @@ if (nextStatus === 'failed') {
  // inside the `catch (e: any)` of processOne, where saleFailed === true
 if (saleFailed) {
   try {
-    await callMarkFailed(pool); // ok if already failed
+    await callMarkFailed(pool);
   } catch (mfErr: any) {
-    log.warn({ id, pool, err: mfErr?.message || String(mfErr) }, 'markFailed attempt failed or not needed');
-  }
+    if (mfErr?.__noMarkFailed) {
+      log.warn({ id, pool }, 'pool impl has no markFailed(); skipping flip');
+    } else {
+      log.warn({ id, pool, err: mfErr?.message || String(mfErr) }, 'markFailed attempt failed or not needed');
+    }
+  }  
 
   try {
     // NEW: sweep refunds for contributors (new impl). No-op on old impl.
@@ -758,25 +782,44 @@ async function pollOnce() {
   const { data } = await supabase
     .from('launches')
     .select('id, pool_address, status, finalized, finalizing, finalize_attempts, start_at, end_at')
-    .in('status', ['upcoming', 'active', 'ended', 'failed']) // include failed so we can mark/refund
-    .not('pool_address', 'is', null) // skip rows without pools
+    .in('status', ['upcoming', 'active', 'ended', 'failed'])
+    .not('pool_address', 'is', null)
     .limit(200);
 
   const now = Date.now();
   const soon = (r: any) => {
     const end = r.end_at ? Date.parse(r.end_at) : Infinity;
-    return end - now <= 7_000; // ending within 7s
+    return end - now <= 7_000;
   };
 
   const hot = (data ?? []).filter(soon);
   const cold = (data ?? []).filter((r) => !soon(r));
 
-  // Do "hot" rows first & in parallel (limit concurrency if many)
-  await Promise.all(hot.map((r) => reconcileStatus(r as any)));
+  // Reconcile hot rows first (in parallel)
+  const hotNexts = await Promise.all(
+    hot.map(async (r) => ({ r, next: await reconcileStatus(r as any) }))
+  );
 
-  // Then the rest (can be sequential or limited parallel)
+  // Then cold rows (sequential to keep RPC load low)
+  const coldNexts: Array<{ r: any; next: Status }> = [];
   for (const r of cold) {
-    await reconcileStatus(r as any);
+    const next = await reconcileStatus(r as any);
+    coldNexts.push({ r, next });
+  }
+
+  // NEW: Kick processing for anything that now needs action and isn't locked/finalized
+  const needsAction = [...hotNexts, ...coldNexts]
+    .filter(({ r, next }) =>
+      (next === 'failed' || next === 'ended') &&
+      r.finalized === false &&
+      r.finalizing === false
+    );
+
+  // Limit concurrency a bit if you want (here: sequential)
+  for (const { r } of needsAction) {
+    await processOne(r as Launch).catch((err) =>
+      log.error({ id: r.id, err: err?.message || String(err) }, 'poller processOne failed')
+    );
   }
 }
 
@@ -821,6 +864,67 @@ function startHttp() {
   app.get('/', (_req, res) => res.status(200).send('ok'));
   // catch-all 200 for GET to satisfy any default probe hitting '/' or another path
   app.get('*', (_req, res) => res.status(200).send('ok'));
+// --- DEBUG: quick snapshot of failure gates ---
+app.get('/debug/snapshot', async (req: Request, res: Response) => {
+  try {
+    const pool = String(req.query.pool || '') as `0x${string}`;
+    if (!pool || !pool.startsWith('0x') || pool.length !== 42) {
+      return res.status(400).json({ ok: false, error: 'Missing/invalid ?pool=0x...' });
+    }
+    const s = await getChainSnapshot(pool);
+    const afterEnd = s.now >= Number(s.endAt);
+    const belowSoft = s.totalRaised < s.softCap;
+    res.json({
+      ok: true,
+      pool,
+      snapshot: {
+        softCap: s.softCap.toString(),
+        hardCap: s.hardCap.toString(),
+        totalRaised: s.totalRaised.toString(),
+        endAt: Number(s.endAt),
+        now: s.now,
+        finalized: s.finalized,
+        failed: s.failed,
+        gates: { afterEnd, belowSoft },
+      },
+    });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// --- DEBUG: force a markFailed attempt (safe/idempotent if already failed) ---
+app.post('/debug/mark-failed-now', async (req: Request, res: Response) => {
+  try {
+    const pool = String(req.query.pool || '') as `0x${string}`;
+    if (!pool || !pool.startsWith('0x') || pool.length !== 42) {
+      return res.status(400).json({ ok: false, error: 'Missing/invalid ?pool=0x...' });
+    }
+    const hash = await callMarkFailed(pool);
+    res.json({ ok: true, pool, tx: hash });
+  } catch (e: any) {
+    res.status(500).json({
+      ok: false,
+      error: e?.shortMessage || e?.message || String(e),
+      cause: e?.cause?.message || e?.cause || null,
+      data: e?.data || e?.cause?.data || null,
+    });
+  }
+});
+
+// --- DEBUG: run one refund sweep batch if failed ---
+app.post('/debug/refund-sweep-now', async (req: Request, res: Response) => {
+  try {
+    const pool = String(req.query.pool || '') as `0x${string}`;
+    if (!pool || !pool.startsWith('0x') || pool.length !== 42) {
+      return res.status(400).json({ ok: false, error: 'Missing/invalid ?pool=0x...' });
+    }
+    await sweepRefundBatch(pool);
+    res.json({ ok: true, pool });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
 
   // Manually trigger a sync() on a given pair (no swap)
   app.post('/sync-now', async (req: Request, res: Response) => {
