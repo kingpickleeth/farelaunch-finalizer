@@ -592,7 +592,12 @@ async function processOne(row: Launch) {
     } catch (e: any) {
       log.warn({ id, pool, err: e?.message || String(e) }, 'pre-claim ensureFailedOnChain() threw');
     }
-  
+    // If refunds are already complete, don't claim & don't write — avoids RT/poller churn
+const doneAlready = await isRefundCompleteCached(pool);
+if (doneAlready) {
+  log.debug({ id, pool }, 'refund already complete; skipping');
+  return;
+}
     const claimed = await tryClaim(id, 'refund');
     if (!claimed) {
       log.debug({ id }, 'could not claim row for refund (another worker or not eligible)');
