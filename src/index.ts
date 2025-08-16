@@ -509,6 +509,8 @@ function markStart(id: string): boolean {
 function markDone(id: string) {
   processing.delete(id);
 }
+const RT_COOLDOWN_MS = Number(process.env.RT_COOLDOWN_MS || 30_000);
+const _rtLast = new Map<string, number>();
 
 // ---------- DB lock & finalize/refund pipeline ----------
 async function tryClaim(id: string, mode: 'finalize' | 'refund'): Promise<boolean> {
@@ -747,7 +749,13 @@ function startRealtime() {
       async (payload) => {
         const next = payload.new as Launch | undefined;
         if (!next) return;
-
+        const now = Date.now();
+        const last = _rtLast.get(next.id) || 0;
+        if (now - last < RT_COOLDOWN_MS) {
+          log.debug({ id: next.id, sinceMs: now - last }, 'RT: cooled down; skipping');
+          return;
+        }
+        _rtLast.set(next.id, now);
         // 🔒 Ignore rows without a pool to prevent log spam / useless processing
         if (!next.pool_address) {
           log.debug({ id: next.id }, 'RT: no pool_address; ignoring');
