@@ -1003,6 +1003,13 @@ app.post('/debug/refund-sweep-now', async (req: Request, res: Response) => {
   app.listen(port, '0.0.0.0', () => {
     log.info({ port, addr: account.address }, 'health server up');
   });
+  // after app.listen(...)
+const stack = (app as any)._router?.stack || [];
+const routes = stack
+  .filter((l: any) => l.route)
+  .map((l: any) => ({ path: l.route.path, methods: Object.keys(l.route.methods) }));
+log.info({ routes }, 'registered routes');
+
 }
 
 process.on('unhandledRejection', (reason) => log.fatal({ reason }, 'unhandledRejection'));
