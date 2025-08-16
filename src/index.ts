@@ -67,6 +67,8 @@ const presalePoolAbi = parseAbi([
   'function finalize() external',
   'function markFailed() external',       // <-- added
   'function refund() external',
+  'function refundAllRemaining(uint256 maxRecipients) external',
+  'function refundedAll() view returns (bool)',
   'function finalized() view returns (bool)',
   'function softCap() view returns (uint256)',
   'function hardCap() view returns (uint256)',
@@ -136,7 +138,41 @@ async function getChainSnapshot(pool: `0x${string}`): Promise<ChainSnapshot> {
   const block = await publicClient.getBlock();
   return { softCap, hardCap, totalRaised, endAt, finalized, failed, now: Number(block.timestamp) };
 }
+async function sweepRefundBatch(pool: `0x${string}`) {
+  const BATCH = Number(process.env.REFUND_BATCH || 200);
+  // Try reading refundedAll(); if the pool is old (no function), readContract will throw.
+  let isFailed = false;
+  let isDone = false;
+  try {
+    const [failed, refundedAll] = await Promise.all([
+      publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'failed' }) as Promise<boolean>,
+      publicClient.readContract({ address: pool, abi: presalePoolAbi, functionName: 'refundedAll' }) as Promise<boolean>,
+    ]);
+    isFailed = failed;
+    isDone = refundedAll;
+  } catch {
+    // Old pool impl: no refundedAll(). Just return; backend can still optionally call refund() for itself.
+    return;
+  }
+  if (!isFailed || isDone) return;
 
+  try {
+    const hash = await walletClient.writeContract({
+      address: pool,
+      abi: presalePoolAbi,
+      functionName: 'refundAllRemaining',
+      args: [BigInt(BATCH)],
+      chain,
+      account,
+    });
+    const r = await publicClient.waitForTransactionReceipt({ hash });
+    if (r.status === 'success') {
+      log.info({ pool, hash, batch: BATCH }, 'refundAllRemaining batch submitted');
+    }
+  } catch (e: any) {
+    log.warn({ pool, err: e?.shortMessage || e?.message || String(e) }, 'refundAllRemaining failed (will try later)');
+  }
+}
 // ---------- Status logic ----------
 function computeNextStatus(row: Launch, chain: ChainSnapshot | null, nowMs: number): Status {
   if (row.status === 'finalized') return 'finalized';
@@ -494,55 +530,46 @@ async function processOne(row: Launch) {
     const nextStatus = await reconcileStatus(row);
 
     // Refund path if sale ended below soft cap (status = 'failed')
-    if (nextStatus === 'failed') {
-      const claimed = await tryClaim(id, 'refund');
-      if (!claimed) {
-        log.debug({ id }, 'could not claim row for refund (another worker or not eligible)');
-        return;
-      }
+  // Refund path if sale ended below soft cap (status = 'failed')
+if (nextStatus === 'failed') {
+  const claimed = await tryClaim(id, 'refund');
+  if (!claimed) {
+    log.debug({ id }, 'could not claim row for refund (another worker or not eligible)');
+    return;
+  }
 
-      // Ensure on-chain failed flag, then attempt refund (idempotent; may be "nothing")
-      try {
-        const { hash } = await callRefund(pool);
-        const { error } = await supabase
-          .from('launches')
-          .update({
-            finalizing: false,
-            finalize_attempts: (row.finalize_attempts ?? 0) + 1,
-            finalize_error: null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', id);
-        if (error) throw error;
-        log.info({ id, pool, tx: hash }, 'refund executed');
-      } catch (e: any) {
-        if (e && e.__noContribution) {
-          // No contribution for this wallet; treat as success/no-op
-          log.info({ id, pool }, 'refund skipped: backend wallet has no contribution');
-          await supabase
-            .from('launches')
-            .update({
-              finalizing: false,
-              finalize_attempts: (row.finalize_attempts ?? 0) + 1,
-              finalize_error: null,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', id);
-        } else {
-          log.error({ id, pool, err: e?.message || String(e) }, 'refund failed');
-          await supabase
-            .from('launches')
-            .update({
-              finalizing: false,
-              finalize_attempts: (row.finalize_attempts ?? 0) + 1,
-              finalize_error: `REFUND_FAILED: ${e?.message || String(e)}`,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', id);
-        }
-      }
-      return;
-    }
+  try {
+    // Make sure on-chain failed flag is set (will call markFailed if eligible)
+    await ensureFailedOnChain(pool);
+    // Kick one sweep batch (new impl); old impl will no-op here
+    await sweepRefundBatch(pool);
+
+    // Clear lock & mark attempt; no DB status flip needed (row is already 'failed')
+    const { error } = await supabase
+      .from('launches')
+      .update({
+        finalizing: false,
+        finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+        finalize_error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id);
+    if (error) throw error;
+    log.info({ id, pool }, 'refund sweep tick executed');
+  } catch (e: any) {
+    log.error({ id, pool, err: e?.message || String(e) }, 'refund sweep tick failed');
+    await supabase
+      .from('launches')
+      .update({
+        finalizing: false,
+        finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+        finalize_error: `REFUND_SWEEP_FAILED: ${e?.message || String(e)}`,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id);
+  }
+  return;
+}
 
     // Finalize path
     if (nextStatus !== 'ended') {
@@ -621,33 +648,41 @@ async function processOne(row: Launch) {
 
     // If we intentionally flagged the sale as "below soft cap after end",
     // set failed on-chain, then attempt refund (may be no-op)
-    if (saleFailed) {
-      try {
-        await callMarkFailed(pool);
-      } catch (mfErr: any) {
-        log.warn({ id, pool, err: mfErr?.message || String(mfErr) }, 'markFailed attempt (from finalize preflight) failed or not needed');
-      }
-      try {
-        const { hash: refundHash } = await callRefund(pool);
-        log.info({ id, pool, tx: refundHash }, 'refund executed (from finalize preflight)');
+ // inside the `catch (e: any)` of processOne, where saleFailed === true
+if (saleFailed) {
+  try {
+    await callMarkFailed(pool); // ok if already failed
+  } catch (mfErr: any) {
+    log.warn({ id, pool, err: mfErr?.message || String(mfErr) }, 'markFailed attempt failed or not needed');
+  }
+
+  try {
+    // NEW: sweep refunds for contributors (new impl). No-op on old impl.
+    await sweepRefundBatch(pool);
+    update.status = 'failed';
+    update.finalized = false;
+    update.finalize_error = null;
+  } catch (er: any) {
+    // OPTIONAL: fallback for old impls (refund() only refunds the caller)
+    try {
+      const { hash: refundHash } = await callRefund(pool);
+      log.info({ id, pool, tx: refundHash }, 'legacy self-refund executed after markFailed');
+      update.status = 'failed';
+      update.finalized = false;
+      update.finalize_error = null;
+    } catch (er2: any) {
+      if (er2 && er2.__noContribution) {
         update.status = 'failed';
         update.finalized = false;
-        update.finalize_error = null; // refund succeeded/no-op; clear error
-      } catch (er: any) {
-        if (er && er.__noContribution) {
-          log.info({ id, pool }, 'refund skipped (no contribution) after markFailed');
-          update.status = 'failed';
-          update.finalized = false;
-          update.finalize_error = null;
-        } else {
-          log.error({ id, pool, err: er?.message || String(er) }, 'refund attempt failed (from finalize preflight)');
-          update.status = 'failed';
-          update.finalized = false;
-          update.finalize_error = `REFUND_FAILED: ${er?.message || String(er)}`;
-        }
+        update.finalize_error = null;
+      } else {
+        update.status = 'failed';
+        update.finalized = false;
+        update.finalize_error = `REFUND_FAILED: ${er2?.message || String(er2)}`;
       }
     }
-
+  }
+}
     await supabase.from('launches').update(update).eq('id', id);
   } finally {
     markDone(id);
