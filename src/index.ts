@@ -885,9 +885,7 @@ function startHttp() {
       res.status(500).json({ ok: false, error: e?.message || String(e) });
     }
   });
-  app.get('/', (_req, res) => res.status(200).send('ok'));
-  // catch-all 200 for GET to satisfy any default probe hitting '/' or another path
-  app.get('*', (_req, res) => res.status(200).send('ok'));
+ 
 // --- DEBUG: quick snapshot of failure gates ---
 app.get('/debug/snapshot', async (req: Request, res: Response) => {
   try {
@@ -994,7 +992,9 @@ app.post('/debug/refund-sweep-now', async (req: Request, res: Response) => {
       res.status(500).json({ ok: false, error: e?.message || String(e) });
     }
   });
-
+  app.get('/', (_req, res) => res.status(200).send('ok'));
+  // catch-all 200 for GET to satisfy any default probe hitting '/' or another path
+  app.get('*', (_req, res) => res.status(200).send('ok'));
   const raw = process.env.PORT ?? '';
   const parsed = parseInt(raw, 10);
   const port = Number.isFinite(parsed) && parsed > 0 ? parsed : 8080; // 8080 for local only
