@@ -311,21 +311,47 @@ async function callFinalize(pool: `0x${string}`): Promise<{ hash: `0x${string}`;
 
 // ---------- markFailed & Refund helpers ----------
 async function callMarkFailed(pool: `0x${string}`): Promise<`0x${string}` | null> {
-  // ... (your preflight)
+  const s = await getChainSnapshot(pool);
+  const afterEnd = s.now >= Number(s.endAt);
+  const belowSoft = s.totalRaised < s.softCap;
 
-  const sim = await publicClient.simulateContract({ address: pool, abi: presalePoolAbi, functionName: 'markFailed', account });
-  const hash = await walletClient.writeContract(sim.request);
-  const r = await publicClient.waitForTransactionReceipt({ hash });
-  if (r.status !== 'success') throw new Error(`markFailed tx failed: ${hash}`);
+  log.info({ pool, afterEnd, belowSoft, failed: s.failed }, 'callMarkFailed preflight');
+  if (s.failed) return null;
+  if (!afterEnd || !belowSoft) throw new Error('NotFailed window not met');
 
-  // OPTIONAL: persist
   try {
-    await supabase.from('processed_txs').insert({ tx_hash: hash });
-  } catch {}
+    const sim = await publicClient.simulateContract({
+      address: pool,
+      abi: presalePoolAbi,
+      functionName: 'markFailed',
+      account,
+    });
+    const hash = await walletClient.writeContract(sim.request);
+    const r = await publicClient.waitForTransactionReceipt({ hash });
+    if (r.status !== 'success') throw new Error(`markFailed tx failed: ${hash}`);
 
-  log.info({ pool, hash }, 'markFailed() confirmed');
-  return hash;
+    try { await supabase.from('processed_txs').insert({ tx_hash: hash }); } catch {}
+    log.info({ pool, hash }, 'markFailed() confirmed');
+    return hash;
+  } catch (e: any) {
+    const msg = (e?.shortMessage || e?.message || '').toLowerCase();
+    const sel = e?.data ?? e?.cause?.data;
+    log.error({
+      pool,
+      msg: e?.shortMessage || e?.message,
+      selector: typeof sel === 'string' ? sel.slice(0, 10) : null,
+      raw: e,
+    }, 'markFailed reverted');
+
+    if (msg.includes('function selector was not recognized') || msg.includes('no matching function'))
+      (e as any).__noMarkFailed = true;
+    if (msg.includes('ownable') || msg.includes('onlyowner') || msg.includes('caller is not the owner'))
+      (e as any).__notAuthorized = true;
+
+    throw e;
+  }
 }
+
 async function ensureFailedOnChain(pool: `0x${string}`): Promise<boolean> {
   const s = await getChainSnapshot(pool);
   const afterEnd = s.now >= Number(s.endAt);
@@ -568,8 +594,24 @@ async function processOne(row: Launch) {
   
       log.info({ id, pool }, 'refund sweep tick executed');
     } catch (e: any) {
-      // ... your existing catch stays the same
-    }
+      const errMsg = e?.shortMessage || e?.message || String(e);
+      log.error({ id, pool, err: errMsg }, 'refund path failed');
+    
+      await supabase
+        .from('launches')
+        .update({
+          finalizing: false,
+          finalize_attempts: (row.finalize_attempts ?? 0) + 1,
+          finalize_error:
+            (e && e.__notAuthorized)
+              ? 'MARK_FAILED_NOT_AUTHORIZED'
+              : (e && e.__noMarkFailed)
+                ? 'MARK_FAILED_NOT_AVAILABLE_ON_IMPL'
+                : `FAILED_BRANCH_ERROR: ${errMsg}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', id);
+    }    
     return;
   }  
 
