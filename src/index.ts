@@ -649,7 +649,7 @@ if (sweep === 'submitted') {
     finalize_error: null,
     updated_at: new Date().toISOString(),
   }).eq('id', id);
-  log.info({ id, pool }, 'refund sweep complete');
+  log.debug({ id, pool }, 'refund sweep complete'); // was info
 } else {
   // "noop" — nothing to do (old impl or already attempted and not yet ready)
   await supabase.from('launches').update({
