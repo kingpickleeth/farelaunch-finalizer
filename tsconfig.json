@@ -3,7 +3,7 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "rootDir": ".",               // ⬅️ changed
+    "rootDir": "src",
     "outDir": "dist",
     "strict": true,
     "skipLibCheck": true,
@@ -12,5 +12,5 @@
     "sourceMap": true,
     "noEmitOnError": true
   },
-  "include": ["index.ts", "src/**/*"]   // ⬅️ include the root server file
+  "include": ["src/**/*"]
 }
